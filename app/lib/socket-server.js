@@ -1,4 +1,6 @@
- import { Server } from "socket.io";
+import { Server } from "socket.io";
+import { Room } from "../config/Models/RoomModel";
+import { UserModel } from "../config/Models/UserModel";
 
 let io;
 
@@ -21,12 +23,22 @@ export const initSocketServer = (httpServer) => {
   });
 
   io.on("connection", (socket) => {
-    console.log(`✅ User connected: ${socket.id}`);
+    console.log(`✅ User connected [socket ID]: ${socket.id}`);
 
     // --- JOIN ROOM ---
-    socket.on("join", ({ roomName, email }) => {
+    socket.on("join", async ({ roomName, email, password }) => {
       socket.data.email = email;
 
+
+      //checking if user exists in db , and getting his username
+
+      const user = await UserModel.findOne({ email }).select("username")
+
+      if (!user) {
+        socket.emit("error", { message: "User not found" });
+        console.log(`❌ User ${email} not found`);
+        return;
+      }
       const room = io.sockets.adapter.rooms.get(roomName);
       const isRoomFull = room && room.size >= 10000;
 
@@ -42,26 +54,65 @@ export const initSocketServer = (httpServer) => {
 
       // If creator
       if (!room) {
-        roomCreators.set(roomName, email);
-        roomUsers.set(roomName, [email]);
 
-        socket.emit("created", { roomName, email });
-        console.log(`🏠 Room created by ${email}`);
+        //creating room entry in db
+
+        const newRoom = new Room({
+          roomName,
+          roomPassword: password,
+          createdBy: user._id
+        })
+
+        await newRoom.save();
+
+
+        roomUsers.set(roomName, [{ email, username: user.username }]);
+
+        socket.emit("created", { roomName, username: user.username });
+
+        console.log(`🏠 Room ${roomName} created by ${user.username}`);
+
+
       } else {
-        const currentUsers = roomUsers.get(roomName) || [];
-        roomUsers.set(roomName, [...currentUsers, email]);
 
-        const creatorEmail = roomCreators.get(roomName);
+        //checking if room exists in db and password is correct (for joinee)
+
+        const dbRoom = await Room.findOne({ roomName })
+
+        if (!dbRoom) {
+          socket.emit("error", { message: "Room does not exist" });
+          console.log(`❌ Room ${roomName} does not exist`);
+          return;
+        }
+
+        if (dbRoom.roomPassword !== password) {
+          socket.emit("error", { message: "Incorrect password" });
+          console.log(`❌ Incorrect password for room ${roomName}`);
+          return;
+        }
+
+
+        const currentUsers = roomUsers.get(roomName) || [];
+        roomUsers.set(roomName, [...currentUsers, { email, username: user.username }]);
+
+
+        //getting creators username
+
+        const creatorUsername = await UserModel.findById(dbRoom.createdBy).select("username");
+
+
+
         socket.emit("joined", {
           roomName,
-          email,
-          creatorEmail,
-          users: [...currentUsers, email],
+          username: user.username,
+          creatorUsername: creatorUsername?.username,
+
+          users: [...currentUsers.map(u => u.username), user?.username],
         });
 
         // Notify existing users
         socket.broadcast.to(roomName).emit("user-joined", {
-          email,
+          username: user.username,
           roomName,
         });
 
@@ -72,7 +123,7 @@ export const initSocketServer = (httpServer) => {
     // --- READY / ICE / OFFER / ANSWER ---
     socket.on("ready", (roomName) => {
       socket.broadcast.to(roomName).emit("ready", {
-        email: socket.data.email,
+        username: socket.data.username,
       });
     });
 
@@ -89,226 +140,114 @@ export const initSocketServer = (httpServer) => {
     });
 
     // --- LEAVE ROOM ---
-    socket.on("leaveRoom", (roomName) => {
-      socket.leave(roomName);
 
-      const email = socket.data.email;
-      const users = roomUsers.get(roomName) || [];
-      roomUsers.set(roomName, users.filter((e) => e !== email));
+    socket.on("leaveRoom", async (roomName) => {
+      try {
+        socket.leave(roomName);
 
-      socket.broadcast.to(roomName).emit("user-left", {
-        email,
-        roomName,
-      });
+        const email = socket.data.email;
+        const users = roomUsers.get(roomName) || [];
+        const user = users.find(u => u.email === email);
+        roomUsers.set(roomName, users.filter((u) => u.email !== email));
 
-      console.log(`🚪 User ${email} left room ${roomName}`);
+        socket.broadcast.to(roomName).emit("user-left", {
+          username: user?.username,
+          roomName,
+        });
+
+        // If room is empty, delete it from database
+
+        if (users.length <= 1) {
+          await Room.deleteOne({ roomName });
+          console.log(`🗑️ Room ${roomName} deleted from database`);
+        }
+
+        console.log(`🚪 User ${user?.username} left room ${roomName}`);
+      } catch (error) {
+        console.error("Error leaving room:", error);
+      }
     });
 
-    // --- KICK USER ---
-    socket.on("kick-user", ({ roomName, targetEmail }) => {
-      const creator = roomCreators.get(roomName);
-      const senderEmail = socket.data.email;
 
-      if (creator !== senderEmail) return;
+    //KICK USER
 
-      const targetSocketId = emailToSocketMapping.get(targetEmail);
-      if (!targetSocketId) return;
+    socket.on("kick-user", async ({ roomName, targetEmail }) => {
+      try {
+        const dbRoom = await Room.findOne({ roomName });
+        if (!dbRoom) {
+          socket.emit("error", { message: "Room not found" });
+          return;
+        }
 
-      const targetSocket = io.sockets.sockets.get(targetSocketId);
-      if (!targetSocket) return;
+        // Check if sender is the creator
+        const senderEmail = socket.data.email;
+        const sender = await UserModel.findOne({ email: senderEmail });
+        if (!sender || !dbRoom.createdBy.equals(sender._id)) {
+          return;
+        }
 
-      targetSocket.leave(roomName);
-      targetSocket.emit("kicked", {
-        roomName,
-        by: senderEmail,
-      });
+        const targetSocketId = emailToSocketMapping.get(targetEmail);
+        if (!targetSocketId) return;
 
-      const users = roomUsers.get(roomName) || [];
-      roomUsers.set(roomName, users.filter((e) => e !== targetEmail));
+        const targetSocket = io.sockets.sockets.get(targetSocketId);
+        if (!targetSocket) return;
 
-      socket.broadcast.to(roomName).emit("user-left", {
-        email: targetEmail,
-        roomName,
-      });
+        const targetUser = await UserModel.findOne({ email: targetEmail }).select('username');
 
-      console.log(`⛔ User ${targetEmail} was kicked from room ${roomName}`);
+        targetSocket.leave(roomName);
+        targetSocket.emit("kicked", {
+          roomName,
+          by: sender.username,
+        });
+
+        const users = roomUsers.get(roomName) || [];
+        roomUsers.set(roomName, users.filter((u) => u.email !== targetEmail));
+
+        socket.broadcast.to(roomName).emit("user-left", {
+          username: targetUser?.username,
+          roomName,
+        });
+
+        console.log(`⛔ User ${targetUser?.username} was kicked from room ${roomName}`);
+      } catch (error) {
+        console.error("Error kicking user:", error);
+      }
     });
+
 
     // --- DISCONNECT ---
-    socket.on("disconnect", () => {
-      const email = socket.data.email;
-      const rooms = Array.from(socket.rooms);
+    socket.on("disconnect", async () => {
+      try {
+        const email = socket.data.email;
+        const user = await UserModel.findOne({ email }).select('username');
+        const rooms = Array.from(socket.rooms);
 
-      rooms.forEach((roomName) => {
-        if (roomName !== socket.id) {
-          socket.broadcast.to(roomName).emit("user-disconnected", {
-            email,
-            roomName,
-          });
+        rooms.forEach(async (roomName) => {
+          if (roomName !== socket.id) {
+            socket.broadcast.to(roomName).emit("user-disconnected", {
+              username: user?.username,
+              roomName,
+            });
 
-          const users = roomUsers.get(roomName) || [];
-          roomUsers.set(roomName, users.filter((e) => e !== email));
-        }
-      });
+            const users = roomUsers.get(roomName) || [];
+            roomUsers.set(roomName, users.filter((u) => u.email !== email));
 
-      emailToSocketMapping.delete(email);
+            // If room is empty, delete it from database
+            if (users.length <= 1) {
+              await Room.deleteOne({ roomName });
+              console.log(`🗑️ Room ${roomName} deleted from database`);
+            }
+          }
+        });
 
-      console.log(`❌ Disconnected: ${email || socket.id}`);
+        emailToSocketMapping.delete(email);
+
+        console.log(`❌ Disconnected: ${user?.username || socket.id}`);
+      } catch (error) {
+        console.error("Error during disconnect:", error);
+      }
     });
   });
 
   return io;
 };
-
-//setting up singleton Socket.IO server instance and attaching it to the HTTP server so that clients can connect and communicate in real-time
-
-
-
-// const SocketHandler = (req, res) => {
-//     if (res.socket.server.io) {
-
-//         //checking if socket is already attached to the HTTP server to avoid multiple instances
-//         // If it is, we can skip the initialization
-
-//         console.log("Server is already running");  //if exists , log it and exit
-//         return res.end()
-//     }
-
-//     let io;
-//     // If it doesn't exist, we create a new instance of Socket.IO and attach it to the HTTP server
-
-//     if (!io) {
-
-
-//         console.log("Initializing Socket.IO");
-
-//         io = new Server(res.socket.server, {
-//             path: '/pages/socket',
-//             addTrailingSlash: false,
-//             cors: {
-//                 origin: '*',
-//                 methods: ["GET", "POST"]
-//             }
-//         });
-//         res.socket.server.io = io
-
-
-//         // Here you can set up your socket event listeners
-//         //this callback will be executed when a new client connects to the server
-
-//         io.on("connection", (socket) => {
-//             console.log(`User connected : ${socket.id}`); //logs unique socket id of the connected user
-//             //THERE ARF CERTAIN EVENTS THAT YOU CAN LISTEN TO AND RESPOND TO
-
-
-//             //when a socket receives a JOIN event , it can go one of three different ways ->
-
-//             //nobody in the room -> emits CREATE evnet
-//             //somebody in the room -> emits JOINED event
-//             //if room is full -> emits FULL event
-
-
-//             /*  
-//            When the socket receives a ready event, it broadcasts [ready] to the room
-        
-//            When the socket receives an offer event, it broadcasts [offer] to the room with the offer data
-        
-//            When the socket receives an answer event, it broadcasts [answer] to the room with the answer data
-        
-//            When it receives the ice - candidate event, it broadcasts [ice - candidate] to the room with the ice - candidates it receives
-        
-//            When it receives the leave event, it broadcasts the [leave] event to the room   */
-
-
-//             //one by one events here
-
-
-//             //a mapping of socket with users
-
-//             const emailToSocketMapping = new Map()
-
-//             //1 -> join
-
-
-//             socket.on("join", ({ roomName, email }) => {
-//                 const { rooms } = io.sockets.adapter
-//                 const room = rooms.get(roomName)
-
-
-//                 socket.data.email = email
-
-//                 if (room === undefined) {
-//                     //nobody in the room
-//                     socket.join(roomName)
-//                     emailToSocketMapping.set(email, socket.id)
-
-//                     socket.broadcast.to(roomName).emit(`User created room ${email} with room ${roomName}`) //emit create event to the user
-
-//                     console.log("user", email, "joined", roomName);
-
-//                 }
-//                 else if (room.size === 1) {
-//                     //someone in the room
-//                     socket.join(roomName).
-//                         emailToSocketMapping.set(email, socket.id)
-//                     socket.broadcast.to(roomName).emit("user joined : ", { email })
-//                     console.log("user", email, "joined", roomName);
-
-//                 }
-//                 else {
-//                     //room is full
-//                     socket.emit("full", roomName)  //emit full event to the user
-//                     console.log(`User ${email} tried to join full room ${roomName}`);
-//                 }
-
-//                 console.log(rooms);
-
-//             })
-
-
-
-//             //2 -> ready
-//             socket.on("ready", roomName => {
-//                 console.log(`User ${socket.data.email} is ready in room ${roomName}`);
-//                 socket.broadcast.to(roomName).emit("ready", {
-//                     email: socket.data.email
-//                 }) //informs the other peer in the room that the user is ready
-//             })
-
-
-//             //3 -> ICE-CANDIDATE
-//             socket.on("ice-candidate", (candidate, roomName) => {
-//                 console.log(`ICE candidate from ${socket.data.email} in room ${roomName}`, candidate);
-//                 socket.broadcast.to(roomName).emit("ice-candidate", candidate) // Sends ice-candidate to the other peer in the room.
-//             })
-
-
-
-//             //4 -> offer
-//             socket.on("offer", (offer, roomName) => {
-//                 console.log(`Offer from ${socket.data.email} in room ${roomName}`);
-//                 socket.broadcast.to(roomName).emit("offer", offer) //broadcasts the offer to the room
-//             })
-
-
-//             //5-> ANSWER
-//             socket.on("answer", (answer, roomName) => {
-//                 console.log(`Answer from ${socket.data.email} in room ${roomName}`);
-//                 socket.broadcast.to(roomName).emit("answer", answer) // Sends Answer to the other peer in the room.
-//             })
-
-
-//             //6 -> LEAVE
-
-//             socket.on("leave", (roomName) => {
-//                 console.log(`User ${socket.data.email} left room ${roomName}`);
-//                 socket.broadcast.to(roomName).emit("leave", {
-//                     email: socket.data.email
-//                 }) //informs the other peer in the room that the user has left
-//             })
-//         })
-//     }
-//     return res.end()  //ending http response since we are just initializing the socket server not sending any data back
-// }
-
-// export default SocketHandler

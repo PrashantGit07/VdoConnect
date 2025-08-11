@@ -5,17 +5,22 @@ import { useState, useEffect, useRef } from "react";
 export default function HomePage() {
     const { socket, isConnected } = useSocket();
     const [email, setEmail] = useState("");
+    const [username, setUsername] = useState(""); // New state for username
     const [roomName, setRoomName] = useState("");
+    const [roomPassword, setRoomPassword] = useState(""); // New state for room password
     const [messages, setMessages] = useState([]);
     const [currentRoom, setCurrentRoom] = useState(null);
-    const [roomUsers, setRoomUsers] = useState([]);
+    const [roomUsers, setRoomUsers] = useState([]); // Now stores {email, username} objects
     const [isCreator, setIsCreator] = useState(false);
-    const [creatorEmail, setCreatorEmail] = useState("");
+    const [creatorUsername, setCreatorUsername] = useState(""); // Changed from creatorEmail
     const messagesEndRef = useRef(null);
 
     useEffect(() => {
         const savedEmail = localStorage.getItem("videoChatEmail");
         if (savedEmail) setEmail(savedEmail);
+
+        const savedUsername = localStorage.getItem("videoChatUsername");
+        if (savedUsername) setUsername(savedUsername);
 
         const savedRoom = localStorage.getItem("videoChatCurrentRoom");
         if (savedRoom) setCurrentRoom(savedRoom);
@@ -23,8 +28,8 @@ export default function HomePage() {
         const savedCreator = localStorage.getItem("videoChatIsCreator");
         if (savedCreator) setIsCreator(savedCreator === "true");
 
-        const savedCreatorEmail = localStorage.getItem("videoChatCreatorEmail");
-        if (savedCreatorEmail) setCreatorEmail(savedCreatorEmail);
+        const savedCreatorUsername = localStorage.getItem("videoChatCreatorUsername");
+        if (savedCreatorUsername) setCreatorUsername(savedCreatorUsername);
 
         const savedMessages = localStorage.getItem("videoChatMessages");
         if (savedMessages) setMessages(JSON.parse(savedMessages));
@@ -35,12 +40,13 @@ export default function HomePage() {
 
     useEffect(() => {
         localStorage.setItem("videoChatEmail", email);
+        localStorage.setItem("videoChatUsername", username);
         localStorage.setItem("videoChatCurrentRoom", currentRoom || "");
         localStorage.setItem("videoChatIsCreator", isCreator.toString());
-        localStorage.setItem("videoChatCreatorEmail", creatorEmail);
+        localStorage.setItem("videoChatCreatorUsername", creatorUsername);
         localStorage.setItem("videoChatMessages", JSON.stringify(messages));
         localStorage.setItem("videoChatRoomUsers", JSON.stringify(roomUsers));
-    }, [email, currentRoom, isCreator, creatorEmail, messages, roomUsers]);
+    }, [email, username, currentRoom, isCreator, creatorUsername, messages, roomUsers]);
 
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -52,74 +58,69 @@ export default function HomePage() {
         const handleCreated = (data) => {
             setCurrentRoom(data.roomName);
             setIsCreator(true);
-            setCreatorEmail(data.email);
-            setRoomUsers([data.email]);
+            setCreatorUsername(username); // Creator is yourself
+            setRoomUsers([{ email, username }]);
             addMessage(`You created room ${data.roomName}`, "system");
         };
 
         const handleJoined = (data) => {
             setCurrentRoom(data.roomName);
-            if (data.creatorEmail) {
-                setCreatorEmail(data.creatorEmail);
+            if (data.creatorUsername) {
+                setCreatorUsername(data.creatorUsername);
             }
+            setRoomUsers(data.users.map(u => ({ email: u.email, username: u.username })));
             addMessage(
-                `You joined room ${data.roomName} (Created by ${data.creatorEmail || "unknown"})`,
+                `You joined room ${data.roomName} (Created by ${data.creatorUsername || "unknown"})`,
                 "system"
             );
         };
 
         const handleUserJoined = (data) => {
-            setRoomUsers(prev =>
-                prev.includes(data.email) ? prev : [...prev, data.email]
-            );
+            setRoomUsers(prev => {
+                const exists = prev.some(u => u.email === data.email);
+                return exists ? prev : [...prev, { email: data.email, username: data.username }];
+            });
 
-            if (data.email === email) {
-                addMessage(`You joined room ${data.roomName}`, "system");
-            } else {
-                addMessage(`User ${data.email} joined the room`, "info");
-            }
+            if (data.email === email) return; // Don't show message for yourself
+            addMessage(`${data.username} joined the room`, "info");
         };
 
         const handleUserLeft = (data) => {
-            const { email: leftEmail, roomName } = data;
+            const { username: leftUsername, roomName } = data;
 
-            setRoomUsers(prev => prev.filter(userEmail => userEmail !== leftEmail));
+            setRoomUsers(prev => prev.filter(user => user.username !== leftUsername));
 
-            if (leftEmail === email) {
+            if (leftUsername === username) {
                 // Current user left
                 addMessage(`You left room ${roomName}`, "system");
                 setCurrentRoom(null);
                 setIsCreator(false);
-                setCreatorEmail("");
+                setCreatorUsername("");
             } else {
                 // Someone else left
-                addMessage(`User ${leftEmail} left the room`, "info");
+                addMessage(`${leftUsername} left the room`, "info");
 
-                if (leftEmail === creatorEmail) {
-                    setCreatorEmail("");
+                if (leftUsername === creatorUsername) {
+                    setCreatorUsername("");
                     addMessage(`Room creator has left`, "system-error");
                 }
             }
         };
 
         const handleKicked = (data) => {
-            addMessage(`You were kicked from room ${data.roomName} by the creator`, "system-error");
+            addMessage(`You were kicked from room ${data.roomName} by ${data.by}`, "system-error");
             setCurrentRoom(null);
             setIsCreator(false);
-            setCreatorEmail("");
+            setCreatorUsername("");
             setRoomUsers([]);
         };
 
-        const handleUserKicked = (data) => {
-            // This handles when someone else gets kicked (for the creator's view)
-            const { email: kickedEmail, roomName } = data;
-
-            setRoomUsers(prev => prev.filter(userEmail => userEmail !== kickedEmail));
-            addMessage(`User ${kickedEmail} was kicked from the room`, "info");
+        const handleFull = (data) => {
+            addMessage(`Room ${data.roomName} is full`, "system-error");
         };
 
-        const handleFull = (data) => {
-            addMessage(`Room ${data.roomName} is full (max 2 users)`, "system-error");
+        const handleError = (data) => {
+            addMessage(`Error: ${data.message}`, "system-error");
         };
 
         socket.on("created", handleCreated);
@@ -128,8 +129,8 @@ export default function HomePage() {
         socket.on("user-left", handleUserLeft);
         socket.on("user-disconnected", handleUserLeft);
         socket.on("kicked", handleKicked);
-        socket.on("user-kicked", handleUserKicked); // New event for when others are kicked
         socket.on("full", handleFull);
+        socket.on("error", handleError);
 
         return () => {
             socket.off("created", handleCreated);
@@ -138,10 +139,10 @@ export default function HomePage() {
             socket.off("user-left", handleUserLeft);
             socket.off("user-disconnected", handleUserLeft);
             socket.off("kicked", handleKicked);
-            socket.off("user-kicked", handleUserKicked);
             socket.off("full", handleFull);
+            socket.off("error", handleError);
         };
-    }, [socket, email, creatorEmail]);
+    }, [socket, email, username, creatorUsername]);
 
     const addMessage = (text, type = "info") => {
         const newMessage = {
@@ -153,12 +154,14 @@ export default function HomePage() {
     };
 
     const handleJoinRoom = () => {
-        if (socket && isConnected && email) {
+        if (socket && isConnected && email && username) {
             const room = roomName || "default-room";
+            const password = roomPassword || ""; // Default empty password
 
             socket.emit("join", {
                 roomName: room,
-                email: email
+                email: email,
+                password: password
             });
         }
     };
@@ -168,7 +171,7 @@ export default function HomePage() {
             socket.emit("leaveRoom", currentRoom);
             setCurrentRoom(null);
             setIsCreator(false);
-            setCreatorEmail("");
+            setCreatorUsername("");
             setRoomUsers([]);
             addMessage(`You left room ${currentRoom}`, "system");
         }
@@ -182,16 +185,18 @@ export default function HomePage() {
             });
 
             // Immediately remove the user from local state
-            setRoomUsers(prev => prev.filter(userEmail => userEmail !== targetEmail));
-            addMessage(`You kicked user ${targetEmail} from the room`, "system");
+            setRoomUsers(prev => prev.filter(user => user.email !== targetEmail));
+            const targetUser = roomUsers.find(u => u.email === targetEmail);
+            addMessage(`You kicked ${targetUser?.username || targetEmail} from the room`, "system");
         }
     };
 
     const clearLocalStorage = () => {
         localStorage.removeItem("videoChatEmail");
+        localStorage.removeItem("videoChatUsername");
         localStorage.removeItem("videoChatCurrentRoom");
         localStorage.removeItem("videoChatIsCreator");
-        localStorage.removeItem("videoChatCreatorEmail");
+        localStorage.removeItem("videoChatCreatorUsername");
         localStorage.removeItem("videoChatMessages");
         localStorage.removeItem("videoChatRoomUsers");
         setMessages([]);
@@ -215,6 +220,17 @@ export default function HomePage() {
                         />
                     </div>
                     <div className="mb-3">
+                        <label className="block mb-1 font-medium">Your Username</label>
+                        <input
+                            type="text"
+                            placeholder="Enter your username..."
+                            value={username}
+                            onChange={(e) => setUsername(e.target.value)}
+                            className="w-full border p-2 rounded"
+                            required
+                        />
+                    </div>
+                    <div className="mb-3">
                         <label className="block mb-1 font-medium">Room Name</label>
                         <input
                             type="text"
@@ -224,10 +240,20 @@ export default function HomePage() {
                             className="w-full border p-2 rounded"
                         />
                     </div>
+                    <div className="mb-3">
+                        <label className="block mb-1 font-medium">Room Password</label>
+                        <input
+                            type="password"
+                            placeholder="Enter password (required for existing rooms)"
+                            value={roomPassword}
+                            onChange={(e) => setRoomPassword(e.target.value)}
+                            className="w-full border p-2 rounded"
+                        />
+                    </div>
                     <button
                         onClick={handleJoinRoom}
                         className="bg-blue-500 hover:bg-blue-600 cursor-pointer text-white p-2 rounded w-full"
-                        disabled={!isConnected || !email}
+                        disabled={!isConnected || !email || !username}
                     >
                         {isConnected ? "Join Room" : "Connecting..."}
                     </button>
@@ -242,9 +268,9 @@ export default function HomePage() {
                                     (You are the creator)
                                 </span>
                             )}
-                            {!isCreator && creatorEmail && (
+                            {!isCreator && creatorUsername && (
                                 <span className="ml-2 text-sm bg-blue-700 text-white px-2 py-1 rounded">
-                                    (Created by {creatorEmail})
+                                    (Created by {creatorUsername})
                                 </span>
                             )}
                         </div>
@@ -259,16 +285,16 @@ export default function HomePage() {
                     <div className="mb-4">
                         <h3 className="font-semibold mb-2">Users in Room ({roomUsers.length}):</h3>
                         <ul className="border rounded divide-y">
-                            {roomUsers.map((userEmail, index) => (
+                            {roomUsers.map((user, index) => (
                                 <li key={index} className="flex justify-between items-center p-2">
-                                    <span className={userEmail === email ? "font-medium" : ""}>
-                                        {userEmail}
-                                        {userEmail === email && " (You)"}
-                                        {userEmail === creatorEmail && " (Creator)"}
+                                    <span className={user.email === email ? "font-medium" : ""}>
+                                        {user.username}
+                                        {user.email === email && " (You)"}
+                                        {user.username === creatorUsername && " (Creator)"}
                                     </span>
-                                    {isCreator && userEmail !== email && (
+                                    {isCreator && user.email !== email && (
                                         <button
-                                            onClick={() => handleKickUser(userEmail)}
+                                            onClick={() => handleKickUser(user.email)}
                                             className="text-sm bg-red-600 hover:bg-red-700 cursor-pointer text-white px-3 py-1 rounded"
                                         >
                                             Kick

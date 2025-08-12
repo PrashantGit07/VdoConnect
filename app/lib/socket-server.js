@@ -6,7 +6,7 @@ let io;
 
 const emailToSocketMapping = new Map();
 const roomCreators = new Map();
-const roomUsers = new Map(); // Map<roomName, string[]>
+const roomUsers = new Map(); // Map<roomName, {email: string, username: string}[]>
 
 export const initSocketServer = (httpServer) => {
   if (io) return io;
@@ -22,232 +22,310 @@ export const initSocketServer = (httpServer) => {
     },
   });
 
+  // Periodic cleanup of stale connections
+  setInterval(() => {
+    console.log("🔄 Running connection cleanup...");
+    const currentTime = Date.now();
+
+    for (const [email, socketId] of emailToSocketMapping.entries()) {
+      const socket = io.sockets.sockets.get(socketId);
+      if (!socket) {
+        emailToSocketMapping.delete(email);
+        console.log(`🧹 Cleaned up stale mapping for ${email}`);
+      }
+    }
+  }, 60000); // Run every minute
+
   io.on("connection", (socket) => {
-    console.log(`✅ User connected [socket ID]: ${socket.id}`);
+    console.log(`✅ New connection [ID]: ${socket.id}`);
+
+    // Track connection time for debugging
+    socket.data.connectedAt = new Date().toISOString();
 
     // --- JOIN ROOM ---
-    socket.on("join", async ({ roomName, email, password }) => {
-      socket.data.email = email;
+    socket.on("join", async ({ roomName, email, password }, callback) => {
+      try {
+        console.log(`🚪 Join attempt: ${email} to ${roomName}`);
 
+        // Validate input
+        if (!email || !roomName) {
+          throw new Error("Email and room name are required");
+        }
 
-      //checking if user exists in db , and getting his username
+        socket.data.email = email;
+        emailToSocketMapping.set(email, socket.id);
+        console.log(`📌 Mapped ${email} to socket ${socket.id}`);
 
-      const user = await UserModel.findOne({ email }).select("username")
+        // Get user from database
+        const user = await UserModel.findOne({ email }).select("username");
+        if (!user) {
+          throw new Error("User not found");
+        }
 
-      if (!user) {
-        socket.emit("error", { message: "User not found" });
-        console.log(`❌ User ${email} not found`);
-        return;
+        const room = io.sockets.adapter.rooms.get(roomName);
+        const isRoomFull = room && room.size >= 10000;
+
+        if (isRoomFull) {
+          socket.emit("full", { roomName });
+          console.log(`⚠️ Room ${roomName} is full`);
+          return callback({ error: "Room is full" });
+        }
+
+        // Join the room
+        socket.join(roomName);
+
+        // If creator (first user in room)
+        if (!room) {
+          // Create room in database
+          const newRoom = new Room({
+            roomName,
+            roomPassword: password,
+            createdBy: user._id
+          });
+
+          await newRoom.save();
+          roomUsers.set(roomName, [{ email, username: user.username }]);
+          roomCreators.set(roomName, email);
+
+          console.log(`🏠 Room ${roomName} created by ${user.username}`);
+          callback({
+            status: "created",
+            roomName,
+            username: user.username
+          });
+        } else {
+          // For joiner
+          const dbRoom = await Room.findOne({ roomName });
+          if (!dbRoom) {
+            throw new Error("Room does not exist");
+          }
+
+          if (dbRoom.roomPassword !== password) {
+            throw new Error("Incorrect password");
+          }
+
+          const currentUsers = roomUsers.get(roomName) || [];
+          roomUsers.set(roomName, [...currentUsers, { email, username: user.username }]);
+
+          // Get creator's username
+          const creator = await UserModel.findById(dbRoom.createdBy).select("username");
+
+          console.log(`➕ ${user.username} joined ${roomName}`);
+          callback({
+            status: "joined",
+            roomName,
+            username: user.username,
+            creatorUsername: creator?.username,
+            users: [...currentUsers.map(u => u.username), user.username],
+          });
+
+          // Notify existing users
+          socket.broadcast.to(roomName).emit("user-joined", {
+            username: user.username,
+            email,
+            roomName,
+          });
+        }
+      } catch (error) {
+        console.error("Join error:", error.message);
+        callback({ error: error.message });
+        socket.emit("error", { message: error.message });
       }
-      const room = io.sockets.adapter.rooms.get(roomName);
-      const isRoomFull = room && room.size >= 10000;
+    });
 
-      if (isRoomFull) {
-        socket.emit("full", { roomName });
-        console.log(`⚠️ Room ${roomName} is full`);
-        return;
-      }
+    // --- KICK USER ---
+    socket.on("kick-user", async ({ roomName, targetEmail }, callback) => {
+      try {
+        console.log(`👢 Kick request for ${targetEmail} in ${roomName}`);
 
-      // Join the room
-      socket.join(roomName);
-      emailToSocketMapping.set(email, socket.id);
+        if (!roomName || !targetEmail) {
+          throw new Error("Room name and target email are required");
+        }
 
-      // If creator
-      if (!room) {
-
-        //creating room entry in db
-
-        const newRoom = new Room({
-          roomName,
-          roomPassword: password,
-          createdBy: user._id
-        })
-
-        await newRoom.save();
-
-
-        roomUsers.set(roomName, [{ email, username: user.username }]);
-
-        socket.emit("created", { roomName, username: user.username });
-
-        console.log(`🏠 Room ${roomName} created by ${user.username}`);
-
-
-      } else {
-
-        //checking if room exists in db and password is correct (for joinee)
-
-        const dbRoom = await Room.findOne({ roomName })
-
+        // Verify room exists
+        const dbRoom = await Room.findOne({ roomName });
         if (!dbRoom) {
-          socket.emit("error", { message: "Room does not exist" });
-          console.log(`❌ Room ${roomName} does not exist`);
-          return;
+          throw new Error("Room not found");
         }
 
-        if (dbRoom.roomPassword !== password) {
-          socket.emit("error", { message: "Incorrect password" });
-          console.log(`❌ Incorrect password for room ${roomName}`);
-          return;
+        // Verify sender is creator
+        const senderEmail = socket.data.email;
+        const sender = await UserModel.findOne({ email: senderEmail });
+        if (!sender || !dbRoom.createdBy.equals(sender._id)) {
+          throw new Error("Only room creator can kick users");
         }
 
+        // Verify target exists
+        const targetSocketId = emailToSocketMapping.get(targetEmail);
+        if (!targetSocketId) {
+          console.log("Current mappings:", Array.from(emailToSocketMapping.entries()));
+          throw new Error("User not found in room");
+        }
 
-        const currentUsers = roomUsers.get(roomName) || [];
-        roomUsers.set(roomName, [...currentUsers, { email, username: user.username }]);
+        const targetSocket = io.sockets.sockets.get(targetSocketId);
+        if (!targetSocket) {
+          emailToSocketMapping.delete(targetEmail); // Clean up stale mapping
+          throw new Error("User connection not found");
+        }
 
+        // Get usernames for logging
+        const targetUser = await UserModel.findOne({ email: targetEmail }).select("username");
+        const targetUsername = targetUser?.username || targetEmail;
 
-        //getting creators username
+        // Perform kick
+        targetSocket.leave(roomName);
+        emailToSocketMapping.delete(targetEmail);
 
-        const creatorUsername = await UserModel.findById(dbRoom.createdBy).select("username");
+        // Update room users
+        const users = roomUsers.get(roomName) || [];
+        roomUsers.set(roomName, users.filter(u => u.email !== targetEmail));
 
-
-
-        socket.emit("joined", {
+        // Notify target
+        targetSocket.emit("kicked", {
           roomName,
-          username: user.username,
-          creatorUsername: creatorUsername?.username,
-
-          users: [...currentUsers.map(u => u.username), user?.username],
+          by: sender.username,
+          timestamp: new Date().toISOString()
         });
 
-        // Notify existing users
-        socket.broadcast.to(roomName).emit("user-joined", {
-          username: user.username,
+        // Notify others
+        io.to(roomName).emit("user-left", {
+          username: targetUsername,
+          email: targetEmail,
           roomName,
+          wasKicked: true,
+          by: sender.username
         });
 
-        console.log(`➕ User ${email} joined room ${roomName}`);
+        console.log(`⛔ ${targetUsername} kicked from ${roomName} by ${sender.username}`);
+        callback({ success: true });
+      } catch (error) {
+        console.error("Kick error:", error.message);
+        callback({ error: error.message });
+        socket.emit("error", { message: error.message });
       }
-    });
-
-    // --- READY / ICE / OFFER / ANSWER ---
-    socket.on("ready", (roomName) => {
-      socket.broadcast.to(roomName).emit("ready", {
-        username: socket.data.username,
-      });
-    });
-
-    socket.on("ice-candidate", (candidate, roomName) => {
-      socket.broadcast.to(roomName).emit("ice-candidate", candidate);
-    });
-
-    socket.on("offer", (offer, roomName) => {
-      socket.broadcast.to(roomName).emit("offer", offer);
-    });
-
-    socket.on("answer", (answer, roomName) => {
-      socket.broadcast.to(roomName).emit("answer", answer);
     });
 
     // --- LEAVE ROOM ---
-
     socket.on("leaveRoom", async (roomName) => {
       try {
+        console.log(`🚪 Leave request for ${socket.data.email} from ${roomName}`);
+
+        if (!roomName) return;
+
         socket.leave(roomName);
 
         const email = socket.data.email;
         const users = roomUsers.get(roomName) || [];
         const user = users.find(u => u.email === email);
-        roomUsers.set(roomName, users.filter((u) => u.email !== email));
 
-        socket.broadcast.to(roomName).emit("user-left", {
-          username: user?.username,
-          roomName,
-        });
+        if (user) {
+          // Update room users
+          roomUsers.set(roomName, users.filter(u => u.email !== email));
+          emailToSocketMapping.delete(email);
 
-        // If room is empty, delete it from database
+          // Notify others
+          socket.broadcast.to(roomName).emit("user-left", {
+            username: user.username,
+            email,
+            roomName,
+            wasKicked: false
+          });
 
-        if (users.length <= 1) {
-          await Room.deleteOne({ roomName });
-          console.log(`🗑️ Room ${roomName} deleted from database`);
+          // If room is empty, clean up
+          if (users.length <= 1) {
+            await Room.deleteOne({ roomName });
+            roomUsers.delete(roomName);
+            roomCreators.delete(roomName);
+            console.log(`🗑️ Room ${roomName} deleted (empty)`);
+          }
+
+          console.log(`👋 ${user.username} left ${roomName}`);
         }
-
-        console.log(`🚪 User ${user?.username} left room ${roomName}`);
       } catch (error) {
-        console.error("Error leaving room:", error);
+        console.error("Leave error:", error);
       }
     });
 
-
-    //KICK USER
-
-    socket.on("kick-user", async ({ roomName, targetEmail }) => {
-      try {
-        const dbRoom = await Room.findOne({ roomName });
-        if (!dbRoom) {
-          socket.emit("error", { message: "Room not found" });
-          return;
-        }
-
-        // Check if sender is the creator
-        const senderEmail = socket.data.email;
-        const sender = await UserModel.findOne({ email: senderEmail });
-        if (!sender || !dbRoom.createdBy.equals(sender._id)) {
-          return;
-        }
-
-        const targetSocketId = emailToSocketMapping.get(targetEmail);
-        if (!targetSocketId) return;
-
-        const targetSocket = io.sockets.sockets.get(targetSocketId);
-        if (!targetSocket) return;
-
-        const targetUser = await UserModel.findOne({ email: targetEmail }).select('username');
-
-        targetSocket.leave(roomName);
-        targetSocket.emit("kicked", {
-          roomName,
-          by: sender.username,
-        });
-
-        const users = roomUsers.get(roomName) || [];
-        roomUsers.set(roomName, users.filter((u) => u.email !== targetEmail));
-
-        socket.broadcast.to(roomName).emit("user-left", {
-          username: targetUser?.username,
-          roomName,
-        });
-
-        console.log(`⛔ User ${targetUser?.username} was kicked from room ${roomName}`);
-      } catch (error) {
-        console.error("Error kicking user:", error);
-      }
+    // --- WEBRTC SIGNALING ---
+    socket.on("ready", (roomName) => {
+      socket.broadcast.to(roomName).emit("ready", {
+        socketId: socket.id,
+        email: socket.data.email
+      });
     });
 
+    socket.on("ice-candidate", (candidate, roomName) => {
+      socket.broadcast.to(roomName).emit("ice-candidate", {
+        candidate,
+        sender: socket.id
+      });
+    });
+
+    socket.on("offer", (offer, roomName) => {
+      socket.broadcast.to(roomName).emit("offer", {
+        offer,
+        sender: socket.id
+      });
+    });
+
+    socket.on("answer", (answer, roomName) => {
+      socket.broadcast.to(roomName).emit("answer", {
+        answer,
+        sender: socket.id
+      });
+    });
 
     // --- DISCONNECT ---
     socket.on("disconnect", async () => {
       try {
         const email = socket.data.email;
-        const user = await UserModel.findOne({ email }).select('username');
+        if (email) {
+          emailToSocketMapping.delete(email);
+          console.log(`🗑️ Removed mapping for ${email}`);
+        }
+
         const rooms = Array.from(socket.rooms);
+        const user = await UserModel.findOne({ email }).select("username");
 
         rooms.forEach(async (roomName) => {
           if (roomName !== socket.id) {
-            socket.broadcast.to(roomName).emit("user-disconnected", {
+            // Update room users
+            const users = roomUsers.get(roomName) || [];
+            roomUsers.set(roomName, users.filter(u => u.email !== email));
+
+            // Notify others
+            io.to(roomName).emit("user-disconnected", {
               username: user?.username,
-              roomName,
+              email,
+              roomName
             });
 
-            const users = roomUsers.get(roomName) || [];
-            roomUsers.set(roomName, users.filter((u) => u.email !== email));
-
-            // If room is empty, delete it from database
+            // Clean up empty rooms
             if (users.length <= 1) {
               await Room.deleteOne({ roomName });
-              console.log(`🗑️ Room ${roomName} deleted from database`);
+              roomUsers.delete(roomName);
+              roomCreators.delete(roomName);
+              console.log(`🗑️ Room ${roomName} deleted (disconnect)`);
             }
           }
         });
 
-        emailToSocketMapping.delete(email);
-
         console.log(`❌ Disconnected: ${user?.username || socket.id}`);
       } catch (error) {
-        console.error("Error during disconnect:", error);
+        console.error("Disconnect error:", error);
       }
+    });
+
+    // Error handler
+    socket.on("error", (error) => {
+      console.error(`Socket error [${socket.id}]:`, error);
     });
   });
 
+  return io;
+};
+
+export const getSocketServer = () => {
+  if (!io) throw new Error("Socket.IO server not initialized");
   return io;
 };

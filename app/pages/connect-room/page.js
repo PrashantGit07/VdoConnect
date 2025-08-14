@@ -3,7 +3,7 @@
 import { useSocket } from "@/app/hooks/useSocket";
 import { useState, useEffect, useRef } from "react";
 import toast from "react-hot-toast";
-
+import { FaMicrophone, FaMicrophoneSlash, FaVideo, FaVideoSlash } from "react-icons/fa";
 export default function HomePage() {
     const { socket, isConnected } = useSocket();
     const [email, setEmail] = useState("");
@@ -19,6 +19,307 @@ export default function HomePage() {
     const [isLoading, setIsLoading] = useState(true);
     const [isAuthenticated, setIsAuthenticated] = useState(false);
     const videoRef = useRef(null);
+
+
+    //video streaming setup
+
+    const [stream, setStream] = useState(null);
+    const [peers, setPeers] = useState({});
+    const peerConnections = useRef({});
+
+    //initializing media streams
+
+    const initializeMediaStreams = async () => {
+        try {
+            const cameraPermission = await navigator.permissions.query({ name: 'camera' });
+            const microphonePermission = await navigator.permissions.query({ name: 'microphone' });
+
+            if (cameraPermission.state === 'denied' || microphonePermission.state === 'denied') {
+                toast.error("Please enable camera and microphone permissions", { duration: 3000 });
+                return null;
+            }
+
+            const mediaStream = await navigator.mediaDevices.getUserMedia({
+                audio: true,
+                video: true
+            }).catch(error => {
+                console.error("Detailed media error:", error);
+                throw error;
+            });
+
+
+            setStream(mediaStream);
+
+            if (videoRef.current) {
+                videoRef.current.srcObject = mediaStream
+            }
+            return mediaStream
+        }
+        catch (error) {
+            console.error("Error initializing media streams:", error);
+
+            //specific error handling   
+            if (error.name === 'NotAllowedError') {
+                toast.error("Please allow camera and microphone access", { duration: 3000 });
+            } else if (error.name === 'NotFoundError') {
+                toast.error("No media devices found", { duration: 3000 });
+            } else if (error.name === 'NotReadableError') {
+                toast.error("Camera/microphone already in use by another application", { duration: 3000 });
+            } else {
+                toast.error("Failed to access camera/microphone", { duration: 3000 });
+            }
+            toast.error("Failed to initialize media streams", { duration: 3000 });
+        }
+    }
+
+
+    //Creating Peer connection
+
+
+    const createPeerConnecetion = (socketId) => {
+
+        //The RTCPeerConnection interface represents a WebRTC connection between the local computer and a remote peer.
+
+
+        const peerConnection = new RTCPeerConnection({
+
+            iceServers: [
+                {
+                    urls: [
+                        "stun:stun.l.google.com:19302",
+                        "stun:stun1.l.google.com:19302",
+                        "stun:stun2.l.google.com:19302",
+                    ]
+                }
+            ]
+
+        })
+
+        //adding out stream tracks to peer connection
+
+        if (stream) {
+            stream.getTracks().forEach((track) => {
+                peerConnection.addTrack(track, stream)
+            })
+        }
+
+        //ICE condidate handler
+
+        peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+                socket.emit("ice-candidate", event.candidate, currentRoom, socketId);
+            }
+        };
+
+        //Tracking handler for remote streams
+
+        peerConnection.ontrack = (event) => {
+            setPeers((prevPeers) => ({
+                ...prevPeers,
+                [socketId]: event.streams[0]
+            }))
+        }
+
+        peerConnections.current[socketId] = peerConnection;
+        return peerConnection;
+    }
+
+    const handleStreaming = async () => {
+
+        if (!isCreator || !currentRoom) {
+            toast.error("Only room creator can start streaming", { duration: 3000 });
+            return;
+        }
+
+        try {
+
+            const mediaStream = await initializeMediaStreams();
+            if (!mediaStream) {
+                toast.error("Failed to initialize media streams", { duration: 3000 });
+                return;
+            }
+
+            // Emit event to notify others in the room
+            socket.emit("ready", currentRoom)
+            toast.success("Streaming started", { duration: 3000 });
+        }
+        catch (error) {
+            console.error("Error starting streaming:", error);
+            toast.error("Failed to start streaming", { duration: 3000 });
+        }
+    }
+
+
+    //handling mute unmute
+
+    const handleToogleMute = () => {
+        if (!stream) {
+            toast.error("No media stream available", { duration: 3000 });
+            return;
+        }
+
+        const audioTracks = stream.getAudioTracks();
+        audioTracks.forEach((track) => {
+            track.enabled = !track.enabled;
+        })
+
+        setIsMuted(!isMuted);
+        toast.success(isMuted ? "Microphone unmuted" : "Microphone muted", { duration: 2000 });
+    }
+
+    //handling camera on off
+
+    const handleToogleVideo = () => {
+        if (!stream) {
+            toast.error("No media stream available", { duration: 3000 });
+            return;
+        }
+
+        const videoTracks = stream.getVideoTracks();
+        videoTracks.forEach((track) => {
+            track.enabled = !track.enabled;
+        })
+
+        setIsCameraOff(!isCameraOff);
+        toast.success(isCameraOff ? "Camera turned on" : "Camera turned off", { duration: 2000 });
+    }
+
+
+    useEffect(() => {
+        if (!socket || !currentRoom) return;
+
+        //wehn another peer is ready ->creating offer
+
+        const handleReady = async ({ socketId, email }) => {
+            if (email === socket.data.email) return;
+            const peerConnection = createPeerConnecetion(socketId)
+
+            try {
+
+
+                //creating offer
+                const offer = await peerConnection.createOffer()
+
+                await peerConnection.setLocalDescription(offer);
+
+                //sending offer to the other peer
+                socket.emit("offer", offer, currentRoom, socketId)
+            }
+            catch (error) {
+                console.error("Error creating peer connection:", error);
+                toast.error("Failed to create peer connection", { duration: 3000 });
+            }
+        }
+
+
+        // When receiving an offer
+
+        const handleOffer = async ({ offer, sender }) => {
+
+            if (!stream) {
+                toast.error("No media stream available", { duration: 3000 });
+                return;
+            }
+
+            const peerConnection = createPeerConnecetion(sender)
+
+            try {
+
+                //The setRemoteDescription() method of the RTCPeerConnection interface sets the specified session description as the remote peer's current offer or answer.
+
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(offer))
+
+                //creating answer
+
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+
+
+                //sending answer to the other peer
+                socket.emit("answer", answer, currentRoom, sender)
+            }
+            catch (error) {
+                console.error("Error creating peer connection:", error);
+                toast.error("Failed to create peer connection", { duration: 3000 });
+            }
+        }
+
+
+        //when receiving an answer
+
+        const handleAnswer = async ({ answer, sender }) => {
+            const peerConnection = peerConnections.current[sender];
+            if (!peerConnection) {
+                console.error("No peer connection found for sender:", sender);
+                return;
+            }
+
+            try {
+
+                await peerConnection.setLocalDescription(new RTCSessionDescription(answer));
+            }
+            catch (error) {
+                console.error("Error setting remote description:", error);
+                toast.error("Failed to set remote description", { duration: 3000 });
+            }
+        }
+
+
+        //when receiving an ice candidate
+
+        const handleIceCandidate = async ({ candidate, sender }) => {
+            const peerConnection = peerConnections.current[sender];
+            if (!peerConnection) {
+                console.error("No peer connection found for sender:", sender);
+                return;
+            }
+            try {
+
+                await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+            } catch (error) {
+                console.error("Error handling ICE candidate:", error);
+                toast.error("Failed to handle ICE candidate", { duration: 3000 });
+            }
+        }
+
+
+        socket.on("ready", handleReady)
+        socket.on("offer", handleOffer)
+        socket.on("answer", handleAnswer)
+        socket.on("ice-candidate", handleIceCandidate);
+
+
+        return () => {
+            socket.off("ready", handleReady);
+            socket.off("offer", handleOffer);
+            socket.off("answer", handleAnswer);
+            socket.off("ice-candidate", handleIceCandidate);
+        }
+
+    }, [socket, currentRoom, stream])
+
+
+
+    //cleanup peer connection on leaving room or component unmount  
+
+    useEffect(() => {
+        return () => {
+            Object.values(peerConnections.current).forEach((peerConnection) => {
+                peerConnection.close()
+            })
+            peerConnections.current = {};
+
+
+            //cleanup media stream
+
+            if (stream) {
+                stream.getTracks().forEach((track) => track.stop())
+                setStream(null);
+            }
+        }
+    }, [])
+
+
 
     // Fetch current user details on component mount
     useEffect(() => {
@@ -309,6 +610,8 @@ export default function HomePage() {
         );
     }
 
+
+
     return (
         <div className="p-4 max-w-6xl mx-auto text-white">
             <div className="flex justify-between items-center mb-4">
@@ -413,19 +716,57 @@ export default function HomePage() {
 
                         <div className="w-3/4 p-4 bg-gray-700 h-[calc(100vh-200px)] flex flex-col">
                             <div className="flex-1 bg-black rounded-lg overflow-hidden relative flex items-center justify-center text-white">
+
                                 <div className="w-full h-full flex items-center justify-center">
-                                    <div className="text-center">
+                                    {stream ? (
+                                        <div>
+                                            <video
+
+                                                ref={videoRef}
+                                                autoPlay
+                                                muted
+                                                playsInline
+                                                className={`${isCameraOff ? 'hidden' : 'block'} absolute bottom-4 right-4 w-1/4 h-1/4 rounded-lg border-2 border-white`}
+                                            />
+
+                                            {/* remote streams  */}
+
+                                            {Object.entries(peers).map(([socketId, peerStream]) => (
+                                                <video
+                                                    key={socketId}
+                                                    autoPlay
+                                                    playsInline
+                                                    className="w-full h-full object-cover"
+                                                    ref={(video) => {
+                                                        if (video) video.srcObject = peerStream;
+                                                    }}
+                                                />
+                                            ))}
+
+
+
+                                            {/* controls overlay  */}
+                                            {/* Controls overlay */}
+                                            <div className="absolute bottom-4 left-0 right-0 flex justify-center space-x-4">
+                                                <button
+                                                    onClick={handleToggleMute}
+                                                    className={`${isMuted ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'} text-white p-3 rounded-full`}
+                                                >
+                                                    {isMuted ? <FaMicrophoneSlash /> : <FaMicrophone />}
+                                                </button>
+                                                <button
+                                                    onClick={handleToggleCamera}
+                                                    className={`${isCameraOff ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'} text-white p-3 rounded-full`}
+                                                >
+                                                    {isCameraOff ? <FaVideoSlash /> : <FaVideo />}
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ) : <div className="text-center">
                                         <p className="text-white text-xl">
                                             {getVideoAreaMessage()}
                                         </p>
-                                        <video
-                                            ref={videoRef}
-                                            autoPlay
-                                            muted={isMuted}
-                                            playsInline
-                                            className={`${isCameraOff ? 'hidden' : 'block'} max-w-full max-h-full`}
-                                        />
-                                    </div>
+                                    </div>}
                                 </div>
                             </div>
 

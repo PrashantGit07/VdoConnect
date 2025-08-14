@@ -116,7 +116,7 @@ export default function AuthPage() {
                         disabled={loading}
                         className="w-full py-3 rounded-lg bg-gradient-to-r from-blue-500 to-blue-700 hover:from-blue-400 hover:to-blue-600 transition-colors text-white font-semibold cursor-pointer"
                     >
-                        {loading ? "Please wait..." : isLogin ? "Login" : "Sign Up"}
+                        {loading ? "Bhai bas ek second.." : isLogin ? "Login" : "Sign Up"}
                     </motion.button>
                 </form>
 

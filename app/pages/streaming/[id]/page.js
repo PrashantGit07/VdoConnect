@@ -124,6 +124,17 @@ export default function StreamingPage() {
             toast.error("Failed to start streaming", { duration: 3000 });
         }
     };
+    const getVideoAreaMessage = () => {
+        if (isCreator) {
+            return isStreaming ? "Your stream" : "Click 'Start Streaming' to begin";
+        }
+
+        if (!creatorUsername) {
+            return "The organizer has left the room";
+        }
+
+        return `Waiting for ${creatorUsername}'s stream`;
+    };
 
     // Pause/Resume streaming
     const handlePauseResumeStream = () => {
@@ -373,7 +384,7 @@ export default function StreamingPage() {
 
         const handleKicked = (data) => {
             toast.error(`You were kicked from room ${data.roomName} by ${data.by}`, { duration: 3000 });
-            router.push('/video-chat');
+            router.push('/pages/connect-room');
         };
 
         socket.on("user-joined", handleUserJoined);
@@ -406,17 +417,7 @@ export default function StreamingPage() {
         }
     };
 
-    const getVideoAreaMessage = () => {
-        if (isCreator) {
-            return isStreaming ? "Your stream" : "Click 'Start Streaming' to begin";
-        }
 
-        if (!creatorUsername) {
-            return "The organizer has left the room";
-        }
-
-        return `Waiting for ${creatorUsername}'s stream`;
-    };
 
     if (isLoading) {
         return (
@@ -515,11 +516,22 @@ export default function StreamingPage() {
                                         />
                                     ))
                                 ) : (
-                                    <div className="w-full h-full flex items-center justify-center">
-                                        <p className="text-white text-xl text-center">
-                                            {getVideoAreaMessage()}
-                                        </p>
+                                    <div className="w-full h-full flex items-center justify-center bg-black">
+                                        {stream ? (
+                                            <video
+                                                ref={videoRef}
+                                                autoPlay
+                                                playsInline
+                                                muted={isCreator} // avoid feedback loop for creator
+                                                className="w-full h-full object-contain"
+                                            />
+                                        ) : (
+                                            <p className="text-white text-xl text-center">
+                                                {getVideoAreaMessage()}
+                                            </p>
+                                        )}
                                     </div>
+
                                 )}
 
                                 {stream && isStreaming && (

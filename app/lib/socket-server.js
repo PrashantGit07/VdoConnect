@@ -6,7 +6,7 @@ let io;
 
 const emailToSocketMapping = new Map();
 const roomCreators = new Map();
-const roomUsers = new Map(); // Map<roomName, {email: string, username: string}[]>
+const roomUsers = new Map();
 
 export const initSocketServer = (httpServer) => {
   if (io) return io;
@@ -25,8 +25,9 @@ export const initSocketServer = (httpServer) => {
   io.on("connection", (socket) => {
     console.log(`New connection [ID]: ${socket.id}`);
 
-    // Track connection time for debugging
+    socket.data = socket.data || {};
     socket.data.connectedAt = new Date().toISOString();
+    socket.data.email = '';
 
     // --- JOIN ROOM ---
     socket.on("join", async ({ roomName, email, password }) => {
@@ -61,10 +62,17 @@ export const initSocketServer = (httpServer) => {
           const newRoom = new Room({
             roomName,
             roomPassword: password,
-            createdBy: user._id
+            createdBy: user._id,
+            joinees: [user._id]
           });
 
-          await newRoom.save();
+          const savedRoom = await newRoom.save();
+
+
+          const populatedRoom = await Room.findById(savedRoom._id)
+            .populate('createdBy', 'username email')
+            .populate('joinees', 'username email');
+
           roomUsers.set(roomName, [{ email, username: user.username }]);
           roomCreators.set(roomName, email);
 
@@ -72,6 +80,15 @@ export const initSocketServer = (httpServer) => {
           socket.emit("created", {
             roomName,
             username: user.username,
+            roomDetails: {
+              id: populatedRoom._id,
+              roomName: populatedRoom.roomName,
+              createdBy: populatedRoom.createdBy,
+              joinees: populatedRoom.joinees,
+              joineeCount: populatedRoom.joinees.length,
+              createdAt: populatedRoom.createdAt,
+              updatedAt: populatedRoom.updatedAt
+            }
           });
         } else {
           // For joiner
@@ -83,6 +100,17 @@ export const initSocketServer = (httpServer) => {
           if (dbRoom.roomPassword !== password) {
             throw new Error("Incorrect password");
           }
+
+          // Add user to joinees if not already present
+          if (!dbRoom.joinees.includes(user._id)) {
+            dbRoom.joinees.push(user._id);
+            await dbRoom.save();
+          }
+
+          // Get updated room details with populated fields
+          const updatedRoom = await Room.findById(dbRoom._id)
+            .populate('createdBy', 'username email')
+            .populate('joinees', 'username email');
 
           const currentUsers = roomUsers.get(roomName) || [];
           roomUsers.set(roomName, [...currentUsers, { email, username: user.username }]);
@@ -96,6 +124,15 @@ export const initSocketServer = (httpServer) => {
             username: user.username,
             creatorUsername: creator?.username,
             users: [...currentUsers.map(u => u.username), user.username],
+            roomDetails: {
+              id: updatedRoom._id,
+              roomName: updatedRoom.roomName,
+              createdBy: updatedRoom.createdBy,
+              joinees: updatedRoom.joinees,
+              joineeCount: updatedRoom.joinees.length,
+              createdAt: updatedRoom.createdAt,
+              updatedAt: updatedRoom.updatedAt
+            }
           });
 
           // Notify existing users
@@ -103,6 +140,7 @@ export const initSocketServer = (httpServer) => {
             username: user.username,
             email,
             roomName,
+            joineeCount: updatedRoom.joinees.length
           });
         }
       } catch (error) {
@@ -145,6 +183,10 @@ export const initSocketServer = (httpServer) => {
         const targetUser = await UserModel.findOne({ email: targetEmail }).select("username");
         const targetUsername = targetUser?.username || targetEmail;
 
+        // Remove user from joinees in database
+        dbRoom.joinees = dbRoom.joinees.filter(joineeId => !joineeId.equals(targetUser._id));
+        await dbRoom.save();
+
         targetSocket.leave(roomName);
         emailToSocketMapping.delete(targetEmail);
 
@@ -162,7 +204,8 @@ export const initSocketServer = (httpServer) => {
           email: targetEmail,
           roomName,
           wasKicked: true,
-          by: sender.username
+          by: sender.username,
+          joineeCount: dbRoom.joinees.length
         });
 
         console.log(`${targetUsername} kicked from ${roomName} by ${sender.username}`);
@@ -180,33 +223,44 @@ export const initSocketServer = (httpServer) => {
 
         console.log(`Leave request for ${email} from ${roomName}`);
 
+        const user = await UserModel.findOne({ email }).select("username");
+        if (!user) return;
+
+        // Remove user from database joinees
+        const dbRoom = await Room.findOne({ roomName });
+        if (dbRoom) {
+          dbRoom.joinees = dbRoom.joinees.filter(joineeId => !joineeId.equals(user._id));
+          await dbRoom.save();
+        }
+
         socket.leave(roomName);
 
         const users = roomUsers.get(roomName) || [];
         const userIndex = users.findIndex(u => u.email === email);
 
         if (userIndex !== -1) {
-          const user = users[userIndex];
+          const userInfo = users[userIndex];
 
           const updatedUsers = users.filter(u => u.email !== email);
           roomUsers.set(roomName, updatedUsers);
           emailToSocketMapping.delete(email);
 
           socket.broadcast.to(roomName).emit("user-left", {
-            username: user.username,
+            username: userInfo.username,
             email,
             roomName,
-            wasKicked: false
+            wasKicked: false,
+            joineeCount: dbRoom ? dbRoom.joinees.length : 0
           });
 
-          if (updatedUsers.length === 0) {
-            await Room.deleteOne({ roomName });
-            roomUsers.delete(roomName);
-            roomCreators.delete(roomName);
-            console.log(`Room ${roomName} deleted (empty)`);
-          }
+          // if (updatedUsers.length === 0) {
+          //   await Room.deleteOne({ roomName });
+          //   roomUsers.delete(roomName);
+          //   roomCreators.delete(roomName);
+          //   console.log(`Room ${roomName} deleted (empty)`);
+          // }
 
-          console.log(`${user.username} left ${roomName}`);
+          console.log(`${userInfo.username} left ${roomName}`);
         }
       } catch (error) {
         console.error("Leave error:", error);
@@ -215,32 +269,57 @@ export const initSocketServer = (httpServer) => {
 
     // --- WEBRTC SIGNALING ---
     socket.on("ready", (roomName) => {
-      socket.broadcast.to(roomName).emit("ready", {
-        socketId: socket.id,
-        email: socket.data.email
+      const room = io.sockets.adapter.rooms.get(roomName);
+      if (room) {
+        room.forEach((socketId) => {
+          if (socketId !== socket.id) {
+            io.to(socketId).emit("ready", {
+              socketId: socket.id,
+              email: socket.email,
+              username: socket.username
+            });
+          }
+        });
+      }
+    });
+
+    socket.on("offer", (offer, roomName, targetSocketId) => {
+      io.to(targetSocketId).emit("offer", {
+        offer,
+        sender: socket.id,
+        senderEmail: socket.email,
+        senderUsername: socket.username
       });
     });
 
-    socket.on("ice-candidate", (candidate, roomName) => {
-      socket.broadcast.to(roomName).emit("ice-candidate", {
+    socket.on("answer", (answer, roomName, targetSocketId) => {
+      io.to(targetSocketId).emit("answer", {
+        answer,
+        sender: socket.id,
+        senderEmail: socket.email,
+        senderUsername: socket.username
+      });
+    });
+
+    socket.on("ice-candidate", (candidate, roomName, targetSocketId) => {
+      io.to(targetSocketId).emit("ice-candidate", {
         candidate,
         sender: socket.id
       });
     });
 
-    socket.on("offer", (offer, roomName) => {
-      socket.broadcast.to(roomName).emit("offer", {
-        offer,
-        sender: socket.id
-      });
+    socket.on("stream-stopped", (roomName) => {
+      socket.to(roomName).emit("stream-stopped");
     });
 
-    socket.on("answer", (answer, roomName) => {
-      socket.broadcast.to(roomName).emit("answer", {
-        answer,
-        sender: socket.id
-      });
-    });
+    // socket.on("disconnect", () => {
+    //   // Notify all rooms about disconnection
+    //   socket.rooms.forEach(roomName => {
+    //     socket.to(roomName).emit("user-disconnected-webrtc", {
+    //       socketId: socket.id
+    //     });
+    //   });
+    // });
 
     // --- DISCONNECT ---
     socket.on("disconnect", async () => {
@@ -254,25 +333,33 @@ export const initSocketServer = (httpServer) => {
         const rooms = Array.from(socket.rooms);
         const user = await UserModel.findOne({ email }).select("username");
 
-        rooms.forEach(async (roomName) => {
+        for (const roomName of rooms) {
           if (roomName !== socket.id) {
             const users = roomUsers.get(roomName) || [];
             roomUsers.set(roomName, users.filter(u => u.email !== email));
 
-            io.to(roomName).emit("user-disconnected", {
-              username: user?.username,
-              email,
-              roomName
-            });
+            // Remove from database joinees
+            const dbRoom = await Room.findOne({ roomName });
+            if (dbRoom && user) {
+              dbRoom.joinees = dbRoom.joinees.filter(joineeId => !joineeId.equals(user._id));
+              await dbRoom.save();
 
-            if (users.length <= 1) {
-              await Room.deleteOne({ roomName });
-              roomUsers.delete(roomName);
-              roomCreators.delete(roomName);
-              console.log(`Room ${roomName} deleted (disconnect)`);
+              io.to(roomName).emit("user-disconnected", {
+                username: user.username,
+                email,
+                roomName,
+                joineeCount: dbRoom.joinees.length
+              });
+
+              // if (dbRoom.joinees.length === 0) {
+              //   await Room.deleteOne({ roomName });
+              //   roomUsers.delete(roomName);
+              //   roomCreators.delete(roomName);
+              //   console.log(`Room ${roomName} deleted (disconnect)`);
+              // }
             }
           }
-        });
+        }
 
         console.log(`Disconnected: ${user?.username || socket.id}`);
       } catch (error) {

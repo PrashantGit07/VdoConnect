@@ -1,325 +1,18 @@
-
 "use client";
 import { useSocket } from "@/app/hooks/useSocket";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import toast from "react-hot-toast";
-import { FaMicrophone, FaMicrophoneSlash, FaVideo, FaVideoSlash } from "react-icons/fa";
-export default function HomePage() {
+import { useRouter } from "next/navigation";
+
+export default function JoinRoomPage() {
     const { socket, isConnected } = useSocket();
     const [email, setEmail] = useState("");
     const [username, setUsername] = useState("");
     const [roomName, setRoomName] = useState("");
     const [roomPassword, setRoomPassword] = useState("");
-    const [currentRoom, setCurrentRoom] = useState(null);
-    const [roomUsers, setRoomUsers] = useState([]);
-    const [isCreator, setIsCreator] = useState(false);
-    const [creatorUsername, setCreatorUsername] = useState("");
-    const [isMuted, setIsMuted] = useState(false);
-    const [isCameraOff, setIsCameraOff] = useState(false);
     const [isLoading, setIsLoading] = useState(true);
     const [isAuthenticated, setIsAuthenticated] = useState(false);
-    const videoRef = useRef(null);
-
-
-    //video streaming setup
-
-    const [stream, setStream] = useState(null);
-    const [peers, setPeers] = useState({});
-    const peerConnections = useRef({});
-
-    //initializing media streams
-
-    const initializeMediaStreams = async () => {
-        try {
-            const cameraPermission = await navigator.permissions.query({ name: 'camera' });
-            const microphonePermission = await navigator.permissions.query({ name: 'microphone' });
-
-            if (cameraPermission.state === 'denied' || microphonePermission.state === 'denied') {
-                toast.error("Please enable camera and microphone permissions", { duration: 3000 });
-                return null;
-            }
-
-            const mediaStream = await navigator.mediaDevices.getUserMedia({
-                audio: true,
-                video: true
-            }).catch(error => {
-                console.error("Detailed media error:", error);
-                throw error;
-            });
-
-
-            setStream(mediaStream);
-
-            if (videoRef.current) {
-                videoRef.current.srcObject = mediaStream
-            }
-            return mediaStream
-        }
-        catch (error) {
-            console.error("Error initializing media streams:", error);
-
-            //specific error handling   
-            if (error.name === 'NotAllowedError') {
-                toast.error("Please allow camera and microphone access", { duration: 3000 });
-            } else if (error.name === 'NotFoundError') {
-                toast.error("No media devices found", { duration: 3000 });
-            } else if (error.name === 'NotReadableError') {
-                toast.error("Camera/microphone already in use by another application", { duration: 3000 });
-            } else {
-                toast.error("Failed to access camera/microphone", { duration: 3000 });
-            }
-            toast.error("Failed to initialize media streams", { duration: 3000 });
-        }
-    }
-
-
-    //Creating Peer connection
-
-
-    const createPeerConnecetion = (socketId) => {
-
-        //The RTCPeerConnection interface represents a WebRTC connection between the local computer and a remote peer.
-
-
-        const peerConnection = new RTCPeerConnection({
-
-            iceServers: [
-                {
-                    urls: [
-                        "stun:stun.l.google.com:19302",
-                        "stun:stun1.l.google.com:19302",
-                        "stun:stun2.l.google.com:19302",
-                    ]
-                }
-            ]
-
-        })
-
-        //adding out stream tracks to peer connection
-
-        if (stream) {
-            stream.getTracks().forEach((track) => {
-                peerConnection.addTrack(track, stream)
-            })
-        }
-
-        //ICE condidate handler
-
-        peerConnection.onicecandidate = (event) => {
-            if (event.candidate) {
-                socket.emit("ice-candidate", event.candidate, currentRoom, socketId);
-            }
-        };
-
-        //Tracking handler for remote streams
-
-        peerConnection.ontrack = (event) => {
-            setPeers((prevPeers) => ({
-                ...prevPeers,
-                [socketId]: event.streams[0]
-            }))
-        }
-
-        peerConnections.current[socketId] = peerConnection;
-        return peerConnection;
-    }
-
-    const handleStreaming = async () => {
-
-        if (!isCreator || !currentRoom) {
-            toast.error("Only room creator can start streaming", { duration: 3000 });
-            return;
-        }
-
-        try {
-
-            const mediaStream = await initializeMediaStreams();
-            if (!mediaStream) {
-                toast.error("Failed to initialize media streams", { duration: 3000 });
-                return;
-            }
-
-            // Emit event to notify others in the room
-            socket.emit("ready", currentRoom)
-            toast.success("Streaming started", { duration: 3000 });
-        }
-        catch (error) {
-            console.error("Error starting streaming:", error);
-            toast.error("Failed to start streaming", { duration: 3000 });
-        }
-    }
-
-
-    //handling mute unmute
-
-    const handleToogleMute = () => {
-        if (!stream) {
-            toast.error("No media stream available", { duration: 3000 });
-            return;
-        }
-
-        const audioTracks = stream.getAudioTracks();
-        audioTracks.forEach((track) => {
-            track.enabled = !track.enabled;
-        })
-
-        setIsMuted(!isMuted);
-        toast.success(isMuted ? "Microphone unmuted" : "Microphone muted", { duration: 2000 });
-    }
-
-    //handling camera on off
-
-    const handleToogleVideo = () => {
-        if (!stream) {
-            toast.error("No media stream available", { duration: 3000 });
-            return;
-        }
-
-        const videoTracks = stream.getVideoTracks();
-        videoTracks.forEach((track) => {
-            track.enabled = !track.enabled;
-        })
-
-        setIsCameraOff(!isCameraOff);
-        toast.success(isCameraOff ? "Camera turned on" : "Camera turned off", { duration: 2000 });
-    }
-
-
-    useEffect(() => {
-        if (!socket || !currentRoom) return;
-
-        //wehn another peer is ready ->creating offer
-
-        const handleReady = async ({ socketId, email }) => {
-            if (email === socket.data.email) return;
-            const peerConnection = createPeerConnecetion(socketId)
-
-            try {
-
-
-                //creating offer
-                const offer = await peerConnection.createOffer()
-
-                await peerConnection.setLocalDescription(offer);
-
-                //sending offer to the other peer
-                socket.emit("offer", offer, currentRoom, socketId)
-            }
-            catch (error) {
-                console.error("Error creating peer connection:", error);
-                toast.error("Failed to create peer connection", { duration: 3000 });
-            }
-        }
-
-
-        // When receiving an offer
-
-        const handleOffer = async ({ offer, sender }) => {
-
-            if (!stream) {
-                toast.error("No media stream available", { duration: 3000 });
-                return;
-            }
-
-            const peerConnection = createPeerConnecetion(sender)
-
-            try {
-
-                //The setRemoteDescription() method of the RTCPeerConnection interface sets the specified session description as the remote peer's current offer or answer.
-
-                await peerConnection.setRemoteDescription(new RTCSessionDescription(offer))
-
-                //creating answer
-
-                const answer = await peerConnection.createAnswer();
-                await peerConnection.setLocalDescription(answer);
-
-
-                //sending answer to the other peer
-                socket.emit("answer", answer, currentRoom, sender)
-            }
-            catch (error) {
-                console.error("Error creating peer connection:", error);
-                toast.error("Failed to create peer connection", { duration: 3000 });
-            }
-        }
-
-
-        //when receiving an answer
-
-        const handleAnswer = async ({ answer, sender }) => {
-            const peerConnection = peerConnections.current[sender];
-            if (!peerConnection) {
-                console.error("No peer connection found for sender:", sender);
-                return;
-            }
-
-            try {
-
-                await peerConnection.setLocalDescription(new RTCSessionDescription(answer));
-            }
-            catch (error) {
-                console.error("Error setting remote description:", error);
-                toast.error("Failed to set remote description", { duration: 3000 });
-            }
-        }
-
-
-        //when receiving an ice candidate
-
-        const handleIceCandidate = async ({ candidate, sender }) => {
-            const peerConnection = peerConnections.current[sender];
-            if (!peerConnection) {
-                console.error("No peer connection found for sender:", sender);
-                return;
-            }
-            try {
-
-                await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
-            } catch (error) {
-                console.error("Error handling ICE candidate:", error);
-                toast.error("Failed to handle ICE candidate", { duration: 3000 });
-            }
-        }
-
-
-        socket.on("ready", handleReady)
-        socket.on("offer", handleOffer)
-        socket.on("answer", handleAnswer)
-        socket.on("ice-candidate", handleIceCandidate);
-
-
-        return () => {
-            socket.off("ready", handleReady);
-            socket.off("offer", handleOffer);
-            socket.off("answer", handleAnswer);
-            socket.off("ice-candidate", handleIceCandidate);
-        }
-
-    }, [socket, currentRoom, stream])
-
-
-
-    //cleanup peer connection on leaving room or component unmount  
-
-    useEffect(() => {
-        return () => {
-            Object.values(peerConnections.current).forEach((peerConnection) => {
-                peerConnection.close()
-            })
-            peerConnections.current = {};
-
-
-            //cleanup media stream
-
-            if (stream) {
-                stream.getTracks().forEach((track) => track.stop())
-                setStream(null);
-            }
-        }
-    }, [])
-
-
+    const router = useRouter();
 
     // Fetch current user details on component mount
     useEffect(() => {
@@ -327,7 +20,7 @@ export default function HomePage() {
             try {
                 const response = await fetch('/api/user/me', {
                     method: 'GET',
-                    credentials: 'include', // Include cookies
+                    credentials: 'include',
                 });
 
                 if (response.ok) {
@@ -335,20 +28,16 @@ export default function HomePage() {
                     setEmail(data.user.email);
                     setUsername(data.user.username);
                     setIsAuthenticated(true);
-
-                    // Load saved room data from localStorage after user is authenticated
-                    loadRoomDataFromStorage();
                 } else {
                     setIsAuthenticated(false);
                     toast.error("Please login to use video chat", { duration: 3000 });
-                    // Redirect to login page or show login form
-                    window.location.href = '/'; // Adjust path as needed
+                    window.location.href = '/';
                 }
             } catch (error) {
                 console.error("Error fetching current user:", error);
                 setIsAuthenticated(false);
                 toast.error("Authentication failed", { duration: 3000 });
-                window.location.href = '/'; // Adjust path as needed
+                window.location.href = '/';
             } finally {
                 setIsLoading(false);
             }
@@ -357,137 +46,38 @@ export default function HomePage() {
         fetchCurrentUser();
     }, []);
 
-    // Load room-related data from localStorage (only after user is authenticated)
-    const loadRoomDataFromStorage = () => {
-        const savedRoom = localStorage.getItem("videoChatCurrentRoom");
-        if (savedRoom) setCurrentRoom(savedRoom);
-
-        const savedCreator = localStorage.getItem("videoChatIsCreator");
-        if (savedCreator) setIsCreator(savedCreator === "true");
-
-        const savedCreatorUsername = localStorage.getItem("videoChatCreatorUsername");
-        if (savedCreatorUsername) setCreatorUsername(savedCreatorUsername);
-
-        const savedRoomUsers = localStorage.getItem("videoChatRoomUsers");
-        if (savedRoomUsers) {
-            try {
-                setRoomUsers(JSON.parse(savedRoomUsers));
-            } catch (error) {
-                console.error("Error parsing saved room users:", error);
-                localStorage.removeItem("videoChatRoomUsers");
-            }
-        }
-    };
-
-    // Save room data to localStorage (but not user data)
-    useEffect(() => {
-        if (isAuthenticated) {
-            localStorage.setItem("videoChatCurrentRoom", currentRoom || "");
-            localStorage.setItem("videoChatIsCreator", isCreator.toString());
-            localStorage.setItem("videoChatCreatorUsername", creatorUsername);
-            localStorage.setItem("videoChatRoomUsers", JSON.stringify(roomUsers));
-        }
-    }, [currentRoom, isCreator, creatorUsername, roomUsers, isAuthenticated]);
-
+    // Socket event handlers
     useEffect(() => {
         if (!socket || !isAuthenticated) return;
 
         const handleCreated = (data) => {
-            setCurrentRoom(data.roomName);
-            setIsCreator(true);
-            setCreatorUsername(username);
-            setRoomUsers([{ email, username }]);
-            toast.success(`You created room ${data.roomName}`, { duration: 3000 });
+            router.push(`/pages/streaming/${data.roomDetails.id}`);
         };
 
         const handleJoined = (data) => {
-            setCurrentRoom(data.roomName);
-            if (data.creatorUsername) {
-                setCreatorUsername(data.creatorUsername);
-            }
-            setRoomUsers(data.users.map(u => ({ email: u.email, username: u.username })));
-            toast.success(
-                `You joined room ${data.roomName} (Created by ${data.creatorUsername || "unknown"})`,
-                { duration: 3000 }
-            );
-        };
-
-        const handleUserJoined = (data) => {
-            setRoomUsers(prev => {
-                const exists = prev.some(u => u.email === data.email);
-                return exists ? prev : [...prev, { email: data.email, username: data.username }];
-            });
-
-            if (data.email === email) return;
-            toast(`${data.username} joined the room`, { duration: 3000 });
-        };
-
-        const handleUserLeft = (data) => {
-            const { username: leftUsername, roomName } = data;
-
-            setRoomUsers(prev => prev.filter(user => user.username !== leftUsername));
-
-            if (leftUsername === username) {
-                toast.success(`You left room ${roomName}`, { duration: 3000 });
-                setCurrentRoom(null);
-                setIsCreator(false);
-                setCreatorUsername("");
-            } else {
-                toast(`${leftUsername} left the room`, { duration: 3000 });
-
-                if (leftUsername === creatorUsername) {
-                    setCreatorUsername("");
-                    toast.error(`Room creator has left`, { duration: 3000 });
-                }
-            }
-        };
-
-        const handleKicked = (data) => {
-            toast.error(`You were kicked from room ${data.roomName} by ${data.by}`, { duration: 3000 });
-
-            // Force immediate state reset to go back to join room UI
-            setCurrentRoom(null);
-            setIsCreator(false);
-            setCreatorUsername("");
-            setRoomUsers([]);
-            setRoomName("");
-            setRoomPassword("");
-
-            // Clear room data from localStorage immediately
-            localStorage.setItem("videoChatCurrentRoom", "");
-            localStorage.setItem("videoChatIsCreator", "false");
-            localStorage.setItem("videoChatCreatorUsername", "");
-            localStorage.setItem("videoChatRoomUsers", "[]");
-        };
-
-        const handleFull = (data) => {
-            toast.error(`Room ${data.roomName} is full`, { duration: 3000 });
+            router.push(`/pages/streaming/${data.roomDetails.id}`);
         };
 
         const handleError = (data) => {
             toast.error(`Error: ${data.message}`, { duration: 3000 });
         };
 
+        const handleFull = (data) => {
+            toast.error(`Room ${data.roomName} is full`, { duration: 3000 });
+        };
+
         socket.on("created", handleCreated);
         socket.on("joined", handleJoined);
-        socket.on("user-joined", handleUserJoined);
-        socket.on("user-left", handleUserLeft);
-        socket.on("user-disconnected", handleUserLeft);
-        socket.on("kicked", handleKicked);
-        socket.on("full", handleFull);
         socket.on("error", handleError);
+        socket.on("full", handleFull);
 
         return () => {
             socket.off("created", handleCreated);
             socket.off("joined", handleJoined);
-            socket.off("user-joined", handleUserJoined);
-            socket.off("user-left", handleUserLeft);
-            socket.off("user-disconnected", handleUserLeft);
-            socket.off("kicked", handleKicked);
-            socket.off("full", handleFull);
             socket.off("error", handleError);
+            socket.off("full", handleFull);
         };
-    }, [socket, email, username, creatorUsername, isAuthenticated]);
+    }, [socket, isAuthenticated, router]);
 
     const handleJoinRoom = () => {
         if (socket && isConnected && email && username) {
@@ -502,82 +92,17 @@ export default function HomePage() {
         }
     };
 
-    const handleLeaveRoom = () => {
-        if (socket && currentRoom) {
-            socket.emit("leaveRoom", currentRoom);
-            setCurrentRoom(null);
-            setIsCreator(false);
-            setCreatorUsername("");
-            setRoomUsers([]);
-            toast.success(`You left room ${currentRoom}`, { duration: 3000 });
-        }
-    };
-
-    const handleKickUser = (targetEmail) => {
-        if (socket && currentRoom && isCreator && targetEmail !== email) {
-            socket.emit("kick-user", {
-                roomName: currentRoom,
-                targetEmail
-            });
-        }
-    };
-
-    const handleToggleMute = () => {
-        setIsMuted(!isMuted);
-        toast.success(isMuted ? "Microphone unmuted" : "Microphone muted", { duration: 2000 });
-    };
-
-    const handleToggleCamera = () => {
-        setIsCameraOff(!isCameraOff);
-        toast.success(isCameraOff ? "Camera turned on" : "Camera turned off", { duration: 2000 });
-    };
-
-    const clearRoomData = () => {
-        localStorage.removeItem("videoChatCurrentRoom");
-        localStorage.removeItem("videoChatIsCreator");
-        localStorage.removeItem("videoChatCreatorUsername");
-        localStorage.removeItem("videoChatRoomUsers");
-        toast.success("Cleared room data", { duration: 3000 });
-
-        // Reset room state
-        setCurrentRoom(null);
-        setIsCreator(false);
-        setCreatorUsername("");
-        setRoomUsers([]);
-    };
-
     const handleLogout = async () => {
         try {
-            // Call logout API to clear server-side session/cookies
             await fetch('/api/user/logout', {
                 method: 'POST',
                 credentials: 'include'
             });
-
-            // Clear all localStorage
-            localStorage.clear();
-
-            // Redirect to login page
             window.location.href = '/';
         } catch (error) {
             console.error("Logout error:", error);
-            // Force redirect even if API call fails
-            localStorage.clear();
             window.location.href = '/';
-
         }
-    };
-
-    const getVideoAreaMessage = () => {
-        if (isCreator) {
-            return "Your stream will appear here";
-        }
-
-        if (!creatorUsername) {
-            return "The organizer has left the room";
-        }
-
-        return `Waiting for ${creatorUsername}'s stream`;
     };
 
     // Loading state
@@ -610,8 +135,6 @@ export default function HomePage() {
         );
     }
 
-
-
     return (
         <div className="p-4 max-w-6xl mx-auto text-white">
             <div className="flex justify-between items-center mb-4">
@@ -627,186 +150,44 @@ export default function HomePage() {
                 </div>
             </div>
 
-            {!currentRoom ? (
-                <div className="mb-4 p-4 border border-gray-600 rounded bg-gray-800 text-white">
-                    <div className="mb-4 p-3 bg-gray-700 rounded">
-                        <p><strong>Logged in as:</strong> {username} ({email})</p>
-                    </div>
-
-                    <div className="mb-3">
-                        <label className="block mb-1 font-medium text-white">Room Name</label>
-                        <input
-                            type="text"
-                            placeholder="Enter room name (leave blank for default)"
-                            value={roomName}
-                            onChange={(e) => setRoomName(e.target.value)}
-                            className="w-full border border-gray-600 bg-gray-700 text-white p-2 rounded placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                        />
-                    </div>
-                    <div className="mb-3">
-                        <label className="block mb-1 font-medium text-white">Room Password</label>
-                        <input
-                            type="password"
-                            placeholder="Enter password (required for existing rooms)"
-                            value={roomPassword}
-                            onChange={(e) => setRoomPassword(e.target.value)}
-                            className="w-full border border-gray-600 bg-gray-700 text-white p-2 rounded placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                        />
-                    </div>
-                    <button
-                        onClick={handleJoinRoom}
-                        className="bg-blue-500 hover:bg-blue-600 cursor-pointer text-white p-2 rounded w-full disabled:opacity-50 disabled:cursor-not-allowed"
-                        disabled={!isConnected}
-                    >
-                        {isConnected ? "Join Room" : "Connecting..."}
-                    </button>
+            <div className="mb-4 p-4 border border-gray-600 rounded bg-gray-800 text-white">
+                <div className="mb-4 p-3 bg-gray-700 rounded">
+                    <p><strong>Logged in as:</strong> {username} ({email})</p>
                 </div>
-            ) : (
-                <div className="border border-gray-600 rounded overflow-hidden bg-gray-800">
-                    <div className="flex justify-between items-center p-4 bg-gray-700 border-b border-gray-600">
-                        <div>
-                            <span className="font-semibold text-white">Room: {currentRoom}</span>
-                            {isCreator && (
-                                <span className="ml-2 text-sm bg-green-700 text-white px-2 py-1 rounded">
-                                    (You are the creator)
-                                </span>
-                            )}
-                            {!isCreator && creatorUsername && (
-                                <span className="ml-2 text-sm bg-blue-700 text-white px-2 py-1 rounded">
-                                    (Created by {creatorUsername})
-                                </span>
-                            )}
-                            {!isCreator && !creatorUsername && (
-                                <span className="ml-2 text-sm bg-red-700 text-white px-2 py-1 rounded">
-                                    (Organizer left)
-                                </span>
-                            )}
-                        </div>
-                        <button
-                            onClick={handleLeaveRoom}
-                            className="bg-red-500 hover:bg-red-600 cursor-pointer text-white p-2 rounded"
-                        >
-                            Leave Room
-                        </button>
-                    </div>
 
-                    <div className="flex">
-                        <div className="w-1/4 border-r border-gray-600 p-4 bg-gray-750 h-[calc(100vh-200px)] overflow-y-auto text-white">
-                            <h3 className="font-semibold mb-4 text-white">Participants ({roomUsers.length})</h3>
-                            <ul className="space-y-2">
-                                {roomUsers.map((user, index) => (
-                                    <li key={index} className="flex justify-between items-center p-2 rounded hover:bg-gray-600 bg-gray-700">
-                                        <span className={`${user.email === email ? "font-medium text-blue-300" : "text-white"}`}>
-                                            {user.username}
-                                            {user.email === email && " (You)"}
-                                            {user.username === creatorUsername && " 👑"}
-                                        </span>
-                                        {isCreator && user.email !== email && (
-                                            <button
-                                                onClick={() => handleKickUser(user.email)}
-                                                className="text-sm bg-red-600 hover:bg-red-700 cursor-pointer text-white px-3 py-1 rounded"
-                                            >
-                                                Kick
-                                            </button>
-                                        )}
-                                    </li>
-                                ))}
-                            </ul>
-                        </div>
-
-                        <div className="w-3/4 p-4 bg-gray-700 h-[calc(100vh-200px)] flex flex-col">
-                            <div className="flex-1 bg-black rounded-lg overflow-hidden relative flex items-center justify-center text-white">
-
-                                <div className="w-full h-full flex items-center justify-center">
-                                    {stream ? (
-                                        <div>
-                                            <video
-
-                                                ref={videoRef}
-                                                autoPlay
-                                                muted
-                                                playsInline
-                                                className={`${isCameraOff ? 'hidden' : 'block'} absolute bottom-4 right-4 w-1/4 h-1/4 rounded-lg border-2 border-white`}
-                                            />
-
-                                            {/* remote streams  */}
-
-                                            {Object.entries(peers).map(([socketId, peerStream]) => (
-                                                <video
-                                                    key={socketId}
-                                                    autoPlay
-                                                    playsInline
-                                                    className="w-full h-full object-cover"
-                                                    ref={(video) => {
-                                                        if (video) video.srcObject = peerStream;
-                                                    }}
-                                                />
-                                            ))}
-
-
-
-                                            {/* controls overlay  */}
-                                            {/* Controls overlay */}
-                                            <div className="absolute bottom-4 left-0 right-0 flex justify-center space-x-4">
-                                                <button
-                                                    onClick={handleToggleMute}
-                                                    className={`${isMuted ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'} text-white p-3 rounded-full`}
-                                                >
-                                                    {isMuted ? <FaMicrophoneSlash /> : <FaMicrophone />}
-                                                </button>
-                                                <button
-                                                    onClick={handleToggleCamera}
-                                                    className={`${isCameraOff ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'} text-white p-3 rounded-full`}
-                                                >
-                                                    {isCameraOff ? <FaVideoSlash /> : <FaVideo />}
-                                                </button>
-                                            </div>
-                                        </div>
-                                    ) : <div className="text-center">
-                                        <p className="text-white text-xl">
-                                            {getVideoAreaMessage()}
-                                        </p>
-                                    </div>}
-                                </div>
-                            </div>
-
-                            <div className="mt-4 flex justify-center space-x-4">
-                                <button
-                                    onClick={handleToggleMute}
-                                    className={`${isMuted ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'} text-white p-2 rounded`}
-                                >
-                                    {isMuted ? 'Unmute' : 'Mute'}
-                                </button>
-                                <button
-                                    onClick={handleToggleCamera}
-                                    className={`${isCameraOff ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'} text-white p-2 rounded`}
-                                >
-                                    {isCameraOff ? 'Camera On' : 'Camera Off'}
-                                </button>
-                                <button
-                                    onClick={handleLeaveRoom}
-                                    className="bg-red-500 hover:bg-red-600 text-white p-2 rounded"
-                                >
-                                    Leave Meeting
-                                </button>
-                                {isCreator && <button className=" bg-red-500 rounded p-2 cursor-pointer text-white" onClick={handleStreaming}>Start Streaming</button>}
-                            </div>
-                        </div>
-                    </div>
+                <div className="mb-3">
+                    <label className="block mb-1 font-medium text-white">Room Name</label>
+                    <input
+                        type="text"
+                        placeholder="Enter room name (leave blank for default)"
+                        value={roomName}
+                        onChange={(e) => setRoomName(e.target.value)}
+                        className="w-full border border-gray-600 bg-gray-700 text-white p-2 rounded placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
                 </div>
-            )}
+                <div className="mb-3">
+                    <label className="block mb-1 font-medium text-white">Room Password</label>
+                    <input
+                        type="password"
+                        placeholder="Enter password (required for existing rooms)"
+                        value={roomPassword}
+                        onChange={(e) => setRoomPassword(e.target.value)}
+                        className="w-full border border-gray-600 bg-gray-700 text-white p-2 rounded placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                </div>
+                <button
+                    onClick={handleJoinRoom}
+                    className="bg-blue-500 hover:bg-blue-600 cursor-pointer text-white p-2 rounded w-full disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled={!isConnected}
+                >
+                    {isConnected ? "Join Room" : "Connecting..."}
+                </button>
+            </div>
 
-            <div className="mt-2 flex justify-between items-center">
+            <div className="mt-2">
                 <span className={`inline-block px-2 py-1 rounded text-sm ${isConnected ? "bg-green-700 text-green-200" : "bg-red-700 text-red-200"}`}>
                     {isConnected ? "Connected to server" : "Disconnected"}
                 </span>
-                <button
-                    onClick={clearRoomData}
-                    className="text-sm text-gray-300 hover:text-white transition-colors"
-                    title="Clear room data only"
-                >
-                    Clear Room Data
-                </button>
             </div>
         </div>
     );

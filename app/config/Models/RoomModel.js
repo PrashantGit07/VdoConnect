@@ -9,6 +9,10 @@ const RoomModel = new mongoose.Schema({
     createdBy: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'User'
+    },
+    joinees: {
+        type: [mongoose.Schema.Types.ObjectId],
+        ref: 'User'
     }
 })
 

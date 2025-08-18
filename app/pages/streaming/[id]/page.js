@@ -1,3 +1,4 @@
+
 "use client";
 import { useSocket } from "@/app/hooks/useSocket";
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -29,37 +30,77 @@ export default function StreamingPage() {
     const [isAuthenticated, setIsAuthenticated] = useState(false);
     const [isStreaming, setIsStreaming] = useState(false);
     const [isStreamPaused, setIsStreamPaused] = useState(false);
+    const [overlayMessage, setOverlayMessage] = useState("");
 
-    const videoRef = useRef(null);
+    const mainVideoRef = useRef(null);
+    const previewVideoRef = useRef(null);
     const remoteVideoRefs = useRef({});
     const streamRef = useRef(null);
     const [stream, setStream] = useState(null);
     const [peers, setPeers] = useState({});
+    const [remoteStreams, setRemoteStreams] = useState({});
     const peerConnections = useRef({});
+
+    // Show overlay message
+    const showOverlayMessage = (message) => {
+        setOverlayMessage(message);
+        setTimeout(() => setOverlayMessage(""), 2000);
+    };
 
     // Initialize media streams
     const initializeMediaStreams = useCallback(async () => {
         try {
-            await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-
+            console.log("Getting user media permissions");
             const mediaStream = await navigator.mediaDevices.getUserMedia({
                 audio: true,
                 video: true
             });
+            console.log("Got media stream successfully");
 
             streamRef.current = mediaStream;
             setStream(mediaStream);
 
-            if (videoRef.current) {
-                videoRef.current.srcObject = mediaStream;
+            // Set to main video for creator
+            if (mainVideoRef.current && isCreator) {
+                mainVideoRef.current.srcObject = mediaStream;
+
+                // Wait for metadata to load before playing
+                const playVideo = () => {
+                    const playPromise = mainVideoRef.current.play();
+
+                    if (playPromise !== undefined) {
+                        playPromise
+                            .then(() => console.log("Video playback started"))
+                            .catch(err => {
+                                console.error("Video play failed, retrying...", err);
+                                // Retry after a short delay
+                                setTimeout(playVideo, 500);
+                            });
+                    }
+                };
+
+                // Start playback attempt
+                if (mainVideoRef.current.readyState >= HTMLMediaElement.HAVE_METADATA) {
+                    playVideo();
+                } else {
+                    mainVideoRef.current.onloadedmetadata = playVideo;
+                }
+            }
+
+            // Set to preview video
+            if (previewVideoRef.current) {
+                previewVideoRef.current.srcObject = mediaStream;
+                previewVideoRef.current.play()
+                    .then(() => console.log("Preview playback started"))
+                    .catch(err => console.error("Preview video play failed", err));
             }
 
             mediaStream.getVideoTracks().forEach(track => {
-                track.enabled = !isMuted
+                track.enabled = !isCameraOff;
             });
 
             mediaStream.getAudioTracks().forEach(track => {
-                track.enabled = !isCameraOff
+                track.enabled = !isMuted;
             });
 
             return mediaStream;
@@ -72,21 +113,31 @@ export default function StreamingPage() {
             }
             return null;
         }
-    }, [isMuted, isCameraOff]);
+    }, [isMuted, isCameraOff, isCreator]);
 
     // Create Peer Connection
     const createPeerConnection = (socketId) => {
+
         const peerConnection = new RTCPeerConnection({
             iceServers: [
                 { urls: ["stun:stun.l.google.com:19302"] }
             ]
         });
 
-        if (stream) {
-            stream.getTracks().forEach((track) => {
-                peerConnection.addTrack(track, stream);
-            });
+        //add our stream track if we have a stream
+        if (streamRef.current && isCreator) {
+            streamRef.current.getTracks().forEach((track) => {
+                peerConnection.addTrack(track, streamRef.current)
+            })
+        } else {
+            peerConnection.addTransceiver("video", { direction: "recvonly" });
+            peerConnection.addTransceiver("audio", { direction: "recvonly" });
         }
+        // if (stream) {
+        //     stream.getTracks().forEach((track) => {
+        //         peerConnection.addTrack(track, stream);
+        //     });
+        // }
 
         peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
@@ -95,11 +146,25 @@ export default function StreamingPage() {
         };
 
         peerConnection.ontrack = (event) => {
-            setPeers((prevPeers) => ({
-                ...prevPeers,
-                [socketId]: event.streams[0]
+            console.log("Received remote stream from:", socketId);
+            const remoteStream = event.streams[0] ?? new MediaStream([e.track]);
+
+            setRemoteStreams(prev => ({
+                ...prev,
+                [socketId]: remoteStream
             }));
+
+            // For joinees, always update the main video with the first received stream
+            if (!isCreator && mainVideoRef.current) {
+                mainVideoRef.current.srcObject = remoteStream
+                const p = mainVideoRef.current.play();
+                if (p) p.catch(err => console.warn("autoplay rejected; user gesture needed", err));
+            }
         };
+
+        peerConnection.onconnectionstatechange = () => {
+            console.log("peer connection state", peerConnection.connectionState);
+        }
 
         peerConnections.current[socketId] = peerConnection;
         return peerConnection;
@@ -124,6 +189,7 @@ export default function StreamingPage() {
             toast.error("Failed to start streaming", { duration: 3000 });
         }
     };
+
     const getVideoAreaMessage = () => {
         if (isCreator) {
             return isStreaming ? "Your stream" : "Click 'Start Streaming' to begin";
@@ -147,11 +213,13 @@ export default function StreamingPage() {
             videoTracks.forEach(track => track.enabled = !isCameraOff);
             audioTracks.forEach(track => track.enabled = !isMuted);
             setIsStreamPaused(false);
+            showOverlayMessage("Stream resumed");
             toast.success("Stream resumed", { duration: 2000 });
         } else {
             videoTracks.forEach(track => track.enabled = false);
             audioTracks.forEach(track => track.enabled = false);
             setIsStreamPaused(true);
+            showOverlayMessage("Stream paused");
             toast.success("Stream paused", { duration: 2000 });
         }
     };
@@ -168,11 +236,16 @@ export default function StreamingPage() {
         Object.values(peerConnections.current).forEach(pc => pc.close());
         peerConnections.current = {};
         setPeers({});
+        setRemoteStreams({});
 
-        if (videoRef.current) {
-            videoRef.current.srcObject = null;
+        if (mainVideoRef.current) {
+            mainVideoRef.current.srcObject = null;
+        }
+        if (previewVideoRef.current) {
+            previewVideoRef.current.srcObject = null;
         }
 
+        socket.emit("stream-stopped", currentRoom);
         toast.success("Streaming stopped", { duration: 3000 });
     };
 
@@ -191,6 +264,7 @@ export default function StreamingPage() {
         });
 
         setIsMuted(newMutedState);
+        showOverlayMessage(newMutedState ? "Microphone muted" : "Microphone unmuted");
         toast.success(newMutedState ? "Microphone muted" : "Microphone unmuted", { duration: 2000 });
     };
 
@@ -209,6 +283,7 @@ export default function StreamingPage() {
         });
 
         setIsCameraOff(newCameraOffState);
+        showOverlayMessage(newCameraOffState ? "Camera turned off" : "Camera turned on");
         toast.success(newCameraOffState ? "Camera turned off" : "Camera turned on", { duration: 2000 });
     };
 
@@ -216,30 +291,40 @@ export default function StreamingPage() {
     useEffect(() => {
         if (!socket || !currentRoom) return;
 
-        const handleReady = async ({ socketId, email: peerEmail }) => {
-            if (peerEmail === socket.data?.email) return;
+        const handleReady = async ({ socketId, email: peerEmail, username: peerUsername }) => {
 
+            if (isCreator) return
+            if (!socketId || peerEmail === email) return;
+
+            console.log("Creating peer connection for:", socketId, peerEmail);
             const peerConnection = createPeerConnection(socketId);
 
             try {
+
                 const offer = await peerConnection.createOffer();
                 await peerConnection.setLocalDescription(offer);
                 socket.emit("offer", offer, currentRoom, socketId);
+
             } catch (error) {
                 console.error("Error creating offer:", error);
                 toast.error("Failed to create peer connection", { duration: 3000 });
             }
         };
 
-        const handleOffer = async ({ offer, sender }) => {
-            if (!stream) return;
 
+        const handleOffer = async ({ offer, sender }) => {
+
+            if (!isCreator) return; // creator should not handle offers, only joinees respond
+
+            console.log("Received offer from:", sender);
             const peerConnection = createPeerConnection(sender);
 
             try {
                 await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+
                 const answer = await peerConnection.createAnswer();
                 await peerConnection.setLocalDescription(answer);
+
                 socket.emit("answer", answer, currentRoom, sender);
             } catch (error) {
                 console.error("Error handling offer:", error);
@@ -264,9 +349,20 @@ export default function StreamingPage() {
             if (!peerConnection) return;
 
             try {
-                await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+                if (candidate) {
+
+                    await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+                }
             } catch (error) {
                 console.error("Error handling ICE candidate:", error);
+            }
+        };
+
+        const handleStreamStopped = () => {
+            // Clear remote streams when creator stops streaming
+            setRemoteStreams({});
+            if (!isCreator && mainVideoRef.current) {
+                mainVideoRef.current.srcObject = null;
             }
         };
 
@@ -274,14 +370,32 @@ export default function StreamingPage() {
         socket.on("offer", handleOffer);
         socket.on("answer", handleAnswer);
         socket.on("ice-candidate", handleIceCandidate);
+        socket.on("stream-stopped", handleStreamStopped);
 
         return () => {
             socket.off("ready", handleReady);
             socket.off("offer", handleOffer);
             socket.off("answer", handleAnswer);
             socket.off("ice-candidate", handleIceCandidate);
+            socket.off("stream-stopped", handleStreamStopped);
         };
-    }, [socket, currentRoom, stream]);
+    }, [socket, currentRoom, stream, isCreator]);
+
+    // Update video display when stream changes
+    useEffect(() => {
+        if (stream && isCreator && mainVideoRef.current) {
+            mainVideoRef.current.srcObject = stream;
+            mainVideoRef.current.play().catch(err => console.error("Video play failed", err));
+        }
+    }, [stream, isCreator]);
+
+    // Update preview video when stream changes
+    useEffect(() => {
+        if (stream && previewVideoRef.current) {
+            previewVideoRef.current.srcObject = stream;
+            previewVideoRef.current.play().catch(err => console.error("Preview video play failed", err));
+        }
+    }, [stream]);
 
     // Cleanup peer connections and media streams
     useEffect(() => {
@@ -291,9 +405,13 @@ export default function StreamingPage() {
             });
             peerConnections.current = {};
 
-            if (stream) {
-                stream.getTracks().forEach((track) => track.stop());
-                setStream(null);
+            if (streamRef.current) {
+                streamRef.current.getTracks().forEach((track) => track.stop());
+                streamRef.current = null
+            }
+
+            if (isStreaming && socket && currentRoom) {
+                socket.emit("stream-stopped", currentRoom);
             }
         };
     }, []);
@@ -341,7 +459,7 @@ export default function StreamingPage() {
             } catch (error) {
                 console.error("Error fetching data:", error);
                 toast.error(error.message || "Failed to load room data", { duration: 3000 });
-                router.push('/video-chat');
+                router.push('/page/connect-room');
             } finally {
                 setIsLoading(false);
             }
@@ -371,7 +489,7 @@ export default function StreamingPage() {
 
             if (leftUsername === username) {
                 toast.success(`You left room ${roomName}`, { duration: 3000 });
-                router.push('/video-chat');
+                router.push('/pages/connect-room');
             } else {
                 toast(`${leftUsername} left the room`, { duration: 3000 });
 
@@ -404,7 +522,7 @@ export default function StreamingPage() {
         if (socket && currentRoom) {
             socket.emit("leaveRoom", currentRoom);
             handleStopStreaming();
-            router.push('/video-chat');
+            router.push('/pages/connect-room');
         }
     };
 
@@ -416,8 +534,6 @@ export default function StreamingPage() {
             });
         }
     };
-
-
 
     if (isLoading) {
         return (
@@ -499,45 +615,44 @@ export default function StreamingPage() {
 
                     <div className="w-3/4 p-4 bg-gray-700 h-[calc(100vh-200px)] flex flex-col">
                         <div className="flex-1 bg-black rounded-lg overflow-hidden relative">
-                            <div className="w-full h-full relative">
-                                {Object.entries(peers).length > 0 ? (
-                                    Object.entries(peers).map(([socketId, peerStream]) => (
-                                        <video
-                                            key={socketId}
-                                            autoPlay
-                                            playsInline
-                                            className="w-full h-full object-cover"
-                                            ref={(video) => {
-                                                if (video && peerStream) {
-                                                    video.srcObject = peerStream;
-                                                    remoteVideoRefs.current[socketId] = video;
-                                                }
-                                            }}
-                                        />
-                                    ))
-                                ) : (
-                                    <div className="w-full h-full flex items-center justify-center bg-black">
-                                        {stream ? (
-                                            <video
-                                                ref={videoRef}
-                                                autoPlay
-                                                playsInline
-                                                muted={isCreator} // avoid feedback loop for creator
-                                                className="w-full h-full object-contain"
-                                            />
-                                        ) : (
-                                            <p className="text-white text-xl text-center">
-                                                {getVideoAreaMessage()}
-                                            </p>
-                                        )}
-                                    </div>
+                            {/* Overlay Message */}
+                            {overlayMessage && (
+                                <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 z-20 bg-black bg-opacity-75 text-white px-4 py-2 rounded-lg text-lg font-medium">
+                                    {overlayMessage}
+                                </div>
+                            )}
 
+                            <div className="w-full h-full relative bg-black">
+                                <video
+                                    ref={mainVideoRef}
+                                    autoPlay
+                                    playsInline
+                                    //muted={isCreator}
+                                    muted
+                                    className={`w-full h-full object-contain ${(isCreator && !stream) || (!isCreator && !Object.values(remoteStreams).length)
+                                        ? 'hidden'
+                                        : 'block'
+                                        }`}
+                                />
+
+                                {/* Show message when no stream available */}
+                                {((isCreator && !isStreaming) || (!isCreator && !Object.keys(remoteStreams).length)) && (
+                                    <div className="absolute inset-0 flex items-center justify-center bg-black">
+                                        <p className="text-white text-xl">
+                                            {isCreator
+                                                ? "Click 'Start Streaming' to begin"
+                                                : creatorUsername
+                                                    ? `Waiting for ${creatorUsername}'s stream`
+                                                    : "The organizer has left the room"}
+                                        </p>
+                                    </div>
                                 )}
 
-                                {stream && isStreaming && (
+                                {/* Preview video for creator */}
+                                {stream && isCreator && isStreaming && (
                                     <div className="absolute bottom-4 right-4 w-48 h-36 rounded-lg border-2 border-white overflow-hidden bg-black">
                                         <video
-                                            ref={videoRef}
+                                            ref={previewVideoRef}
                                             autoPlay
                                             muted
                                             playsInline
@@ -551,22 +666,12 @@ export default function StreamingPage() {
                                     </div>
                                 )}
 
-                                {isCreator && isStreaming && (
-                                    <div className="absolute top-4 right-4 flex space-x-2">
-                                        <button
-                                            onClick={handlePauseResumeStream}
-                                            className={`${isStreamPaused ? 'bg-green-500 hover:bg-green-600' : 'bg-yellow-500 hover:bg-yellow-600'} text-white p-2 rounded-full`}
-                                            title={isStreamPaused ? 'Resume Stream' : 'Pause Stream'}
-                                        >
-                                            {isStreamPaused ? <FaPlay /> : <FaPause />}
-                                        </button>
-                                        <button
-                                            onClick={handleStopStreaming}
-                                            className="bg-red-500 hover:bg-red-600 text-white p-2 rounded-full"
-                                            title="Stop Stream"
-                                        >
-                                            <FaStop />
-                                        </button>
+                                {/* Stream paused overlay */}
+                                {isStreamPaused && isCreator && (
+                                    <div className="absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center">
+                                        <div className="text-white text-2xl font-bold">
+                                            Stream Paused
+                                        </div>
                                     </div>
                                 )}
                             </div>
@@ -589,6 +694,24 @@ export default function StreamingPage() {
                                     >
                                         {isCameraOff ? <FaVideoSlash /> : <FaVideo />}
                                     </button>
+                                    {isCreator && (
+                                        <button
+                                            onClick={handlePauseResumeStream}
+                                            className={`${isStreamPaused ? 'bg-yellow-500 hover:bg-yellow-600' : 'bg-orange-500 hover:bg-orange-600'} text-white p-3 rounded-full`}
+                                            title={isStreamPaused ? 'Resume Stream' : 'Pause Stream'}
+                                        >
+                                            {isStreamPaused ? <FaPlay /> : <FaPause />}
+                                        </button>
+                                    )}
+                                    {isCreator && (
+                                        <button
+                                            onClick={handleStopStreaming}
+                                            className="bg-red-500 hover:bg-red-600 text-white p-3 rounded-full"
+                                            title="Stop Stream"
+                                        >
+                                            <FaStop />
+                                        </button>
+                                    )}
                                 </>
                             )}
 

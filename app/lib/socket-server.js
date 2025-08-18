@@ -36,15 +36,20 @@ export const initSocketServer = (httpServer) => {
           throw new Error("Email and room name are required");
         }
 
-        socket.data.email = email;
-        emailToSocketMapping.set(email, socket.id);
-        console.log(`Mapped ${email} to socket ${socket.id}`);
+        // socket.data.email = email;
+        // emailToSocketMapping.set(email, socket.id);
+        // console.log(`Mapped ${email} to socket ${socket.id}`);
 
         const user = await UserModel.findOne({ email }).select("username");
         if (!user) {
           throw new Error("User not found");
         }
 
+        socket.data.email = email;
+        socket.data.username = user.username;
+
+        emailToSocketMapping.set(email, socket.id);
+        console.log(`Mapped ${email} (${user.username}) to socket ${socket.id}`);
         const room = io.sockets.adapter.rooms.get(roomName);
         const isRoomFull = room && room.size >= 10000;
 
@@ -275,8 +280,8 @@ export const initSocketServer = (httpServer) => {
           if (socketId !== socket.id) {
             io.to(socketId).emit("ready", {
               socketId: socket.id,
-              email: socket.email,
-              username: socket.username
+              email: socket.data?.email,
+              username: socket.data?.username
             });
           }
         });
@@ -287,8 +292,8 @@ export const initSocketServer = (httpServer) => {
       io.to(targetSocketId).emit("offer", {
         offer,
         sender: socket.id,
-        senderEmail: socket.email,
-        senderUsername: socket.username
+        senderEmail: socket.data?.email,
+        senderUsername: socket.data?.username
       });
     });
 
@@ -296,8 +301,8 @@ export const initSocketServer = (httpServer) => {
       io.to(targetSocketId).emit("answer", {
         answer,
         sender: socket.id,
-        senderEmail: socket.email,
-        senderUsername: socket.username
+        senderEmail: socket.data?.email,
+        senderUsername: socket.data?.username
       });
     });
 

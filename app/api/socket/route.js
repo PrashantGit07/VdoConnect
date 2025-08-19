@@ -33,3 +33,5 @@ export const GET = async () => {
         );
     }
 };
+
+// "dev": "next dev --turbopack",

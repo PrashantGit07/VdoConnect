@@ -17,9 +17,13 @@ export const initSocketServer = (httpServer) => {
     path: "/api/socket",
     addTrailingSlash: false,
     cors: {
-      origin: "*",
+      origin: ["http://localhost:3000", "https://a2a76c3a106f.ngrok-free.app"],
       methods: ["GET", "POST"],
+      credentials: true,
+      allowedHeaders: ["Content-Type", "Authorization"]
     },
+    allowEIO3: true,
+    transports: ["websocket", "polling"]
   });
 
   io.on("connection", (socket) => {

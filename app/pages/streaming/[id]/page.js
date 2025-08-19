@@ -627,8 +627,8 @@ export default function StreamingPage() {
                                     ref={mainVideoRef}
                                     autoPlay
                                     playsInline
-                                    //muted={isCreator}
-                                    muted
+                                    muted={isCreator}
+                                    //muted
                                     className={`w-full h-full object-contain ${(isCreator && !stream) || (!isCreator && !Object.values(remoteStreams).length)
                                         ? 'hidden'
                                         : 'block'

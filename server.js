@@ -17,15 +17,18 @@ const emailToSocketMapping = new Map();
 const roomCreators = new Map();
 const roomUsers = new Map();
 
-app.prepare().then(() => {
-    const server = createServer((req, res) => {
+app.prepare().then(() => {  //this line boots nextjs internally  but doesn't start its own server
+    const server = createServer((req, res) => {  //method from http 
         const parsedUrl = parse(req.url, true);
-        handle(req, res, parsedUrl);
+        handle(req, res, parsedUrl); //this line hand offs the server to nextJs pages/api router handles , this way the custom server is used by the netxjs as well to run its /pages /api
     });
 
-    const io = new Server(server, {
+    const io = new Server(server, { // inside the same server here we are creating our socket.io server on the same HTTP layer
         path: "/api/socket",
-        cors: {
+
+        cors: { //this is the main part why we created custom server
+            //this is something which we can not set in nextjs
+            //with custom server now we are controlling our own CORS rules
             origin: ["http://localhost:3000", "https://a2a76c3a106f.ngrok-free.app"],
             methods: ["GET", "POST"],
             credentials: true,

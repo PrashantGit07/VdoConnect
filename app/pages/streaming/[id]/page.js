@@ -1,4 +1,3 @@
-
 "use client";
 import { useSocket } from "@/app/hooks/useSocket";
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -11,7 +10,14 @@ import {
     FaVideoSlash,
     FaPlay,
     FaPause,
-    FaStop
+    FaStop,
+    FaDesktop,
+    FaComments,
+    FaHandPaper,
+    FaTimes,
+    FaUsers,
+    FaExpand,
+    FaCompress
 } from "react-icons/fa";
 
 export default function StreamingPage() {
@@ -31,6 +37,11 @@ export default function StreamingPage() {
     const [isStreaming, setIsStreaming] = useState(false);
     const [isStreamPaused, setIsStreamPaused] = useState(false);
     const [overlayMessage, setOverlayMessage] = useState("");
+    const [isScreenSharing, setisScreenSharing] = useState(false);
+    const [isChatOpen, setIsChatOpen] = useState(false);
+    const [isParticipantsOpen, setIsParticipantsOpen] = useState(false);
+    const [isHandRaised, setIsHandRaised] = useState(false);
+    const [isFullscreen, setIsFullscreen] = useState(false);
 
     const mainVideoRef = useRef(null);
     const previewVideoRef = useRef(null);
@@ -40,6 +51,7 @@ export default function StreamingPage() {
     const [peers, setPeers] = useState({});
     const [remoteStreams, setRemoteStreams] = useState({});
     const peerConnections = useRef({});
+    const screenStreamRef = useRef(null);
 
     // Show overlay message
     const showOverlayMessage = (message) => {
@@ -117,7 +129,6 @@ export default function StreamingPage() {
 
     // Create Peer Connection
     const createPeerConnection = (socketId) => {
-
         const peerConnection = new RTCPeerConnection({
             iceServers: [
                 { urls: ["stun:stun.l.google.com:19302"] }
@@ -133,11 +144,6 @@ export default function StreamingPage() {
             peerConnection.addTransceiver("video", { direction: "recvonly" });
             peerConnection.addTransceiver("audio", { direction: "recvonly" });
         }
-        // if (stream) {
-        //     stream.getTracks().forEach((track) => {
-        //         peerConnection.addTrack(track, stream);
-        //     });
-        // }
 
         peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
@@ -147,7 +153,7 @@ export default function StreamingPage() {
 
         peerConnection.ontrack = (event) => {
             console.log("Received remote stream from:", socketId);
-            const remoteStream = event.streams[0] ?? new MediaStream([e.track]);
+            const remoteStream = event.streams[0] ?? new MediaStream([event.track]);
 
             setRemoteStreams(prev => ({
                 ...prev,
@@ -228,6 +234,10 @@ export default function StreamingPage() {
     const handleStopStreaming = () => {
         if (!stream || !isCreator) return;
 
+        if (isScreenSharing) {
+            stopScreenShare();
+        }
+
         stream.getTracks().forEach(track => track.stop());
         setStream(null);
         setIsStreaming(false);
@@ -292,7 +302,6 @@ export default function StreamingPage() {
         if (!socket || !currentRoom) return;
 
         const handleReady = async ({ socketId, email: peerEmail, username: peerUsername }) => {
-
             if (isCreator) return
             if (!socketId || peerEmail === email) return;
 
@@ -300,20 +309,16 @@ export default function StreamingPage() {
             const peerConnection = createPeerConnection(socketId);
 
             try {
-
                 const offer = await peerConnection.createOffer();
                 await peerConnection.setLocalDescription(offer);
                 socket.emit("offer", offer, currentRoom, socketId);
-
             } catch (error) {
                 console.error("Error creating offer:", error);
                 toast.error("Failed to create peer connection", { duration: 3000 });
             }
         };
 
-
         const handleOffer = async ({ offer, sender }) => {
-
             if (!isCreator) return; // creator should not handle offers, only joinees respond
 
             console.log("Received offer from:", sender);
@@ -350,7 +355,6 @@ export default function StreamingPage() {
 
             try {
                 if (candidate) {
-
                     await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
                 }
             } catch (error) {
@@ -408,6 +412,11 @@ export default function StreamingPage() {
             if (streamRef.current) {
                 streamRef.current.getTracks().forEach((track) => track.stop());
                 streamRef.current = null
+            }
+
+            if (screenStreamRef.current) {
+                screenStreamRef.current.getTracks().forEach((track) => track.stop());
+                screenStreamRef.current = null
             }
 
             if (isStreaming && socket && currentRoom) {
@@ -535,11 +544,109 @@ export default function StreamingPage() {
         }
     };
 
+    const handleToggleScreenShare = async () => {
+        console.log("function called for screen sharing");
+        if (!isStreaming) {
+            console.log("streaming nahi chaalu hai");
+            alert("you are not streaming")
+            return;
+        }
+        try {
+            if (isScreenSharing) {
+                stopScreenShare();
+            } else {
+                //start screen sharing
+                const screenStream = await navigator.mediaDevices.getDisplayMedia({
+                    video: true,
+                    audio: false
+                })
+
+                //handle if user cancels screen share  
+                screenStream.getVideoTracks()[0].onended = stopScreenShare;
+
+                screenStreamRef.current = screenStream
+                setisScreenSharing(true)
+
+                //replacing tracks in all peer connections
+                replaceTrackInAllPeers(screenStream)
+
+                //udpate the local video display
+                if (mainVideoRef.current && isCreator) {
+                    mainVideoRef.current.srcObject = screenStream
+                }
+
+                toast.success("screen share started")
+            }
+        }
+        catch (e) {
+            console.log("error in sharing screen", e);
+        }
+    }
+
+    const stopScreenShare = async () => {
+        if (screenStreamRef.current) {
+            screenStreamRef.current.getTracks().forEach(track => track.stop())
+            screenStreamRef.current = null
+        }
+
+        setisScreenSharing(false)
+
+        //revert to camera in all peers
+        if (streamRef.current) {
+            replaceTrackInAllPeers(streamRef.current)
+        }
+
+        //revert to local video display to camera
+        if (mainVideoRef.current && isCreator && streamRef.current) {
+            mainVideoRef.current.srcObject = streamRef.current
+        }
+        toast.success("screen sharing stopped")
+    }
+
+    const replaceTrackInAllPeers = async (newStream) => {
+        Object.entries(peerConnections.current).forEach(([socketId, pc]) => {
+            const senders = pc.getSenders();
+
+            // Replace video track
+            const videoSender = senders.find(sender =>
+                sender.track && sender.track.kind === 'video'
+            );
+            if (videoSender && newStream.getVideoTracks().length > 0) {
+                videoSender.replaceTrack(newStream.getVideoTracks()[0])
+                    .catch(error => console.error("Error replacing video track:", error));
+            }
+        })
+    }
+
+    const handleToggleChat = () => {
+        setIsChatOpen(!isChatOpen);
+    };
+
+    const handleToggleParticipants = () => {
+        setIsParticipantsOpen(!isParticipantsOpen);
+    };
+
+    const handleToggleHandRaise = () => {
+        setIsHandRaised(!isHandRaised);
+        showOverlayMessage(isHandRaised ? "Hand lowered" : "Hand raised");
+        toast.success(isHandRaised ? "Hand lowered" : "Hand raised", { duration: 2000 });
+    };
+
+    const handleToggleFullscreen = () => {
+        if (!document.fullscreenElement) {
+            document.documentElement.requestFullscreen();
+            setIsFullscreen(true);
+        } else {
+            document.exitFullscreen();
+            setIsFullscreen(false);
+        }
+    };
+
     if (isLoading) {
         return (
-            <div className="p-4 max-w-6xl mx-auto text-white flex justify-center items-center min-h-screen">
-                <div className="text-center">
-                    <div className="animate-spin rounded-full h-32 w-32 border-b-2 border-white mx-auto"></div>
+            <div className="min-h-screen bg-gray-900 flex justify-center items-center">
+                <div className="text-center text-white">
+                    <div className="animate-spin rounded-full h-32 w-32 border-b-2 border-blue-500 mx-auto"></div>
                     <p className="mt-4 text-xl">Loading room data...</p>
                 </div>
             </div>
@@ -547,199 +654,307 @@ export default function StreamingPage() {
     }
 
     return (
-        <div className="p-4 max-w-6xl mx-auto text-white">
-            <div className="flex justify-between items-center mb-4">
-                <h1 className="text-3xl font-bold text-white">Video Call App</h1>
-                <div className="flex items-center space-x-4">
-                    <span className="text-sm">Welcome, {username}!</span>
-                    <button
-                        onClick={handleLeaveRoom}
-                        className="bg-red-500 hover:bg-red-600 cursor-pointer text-white px-3 py-1 rounded text-sm"
-                    >
-                        Leave Room
-                    </button>
+        <div className="min-h-screen bg-gray-900 text-white relative overflow-hidden">
+            {/* Header */}
+            <div className="absolute top-0 left-0 right-0 z-30 bg-gray-800/90 backdrop-blur-sm border-b border-gray-700">
+                <div className="flex justify-between items-center px-4 py-3">
+                    <div className="flex items-center space-x-4">
+                        <h1 className="text-lg font-semibold">Video Call App</h1>
+                        <div className="flex items-center space-x-2 text-sm">
+                            <span className="text-gray-300">Room:</span>
+                            <span className="font-medium">{currentRoom}</span>
+                            {isCreator && (
+                                <span className="bg-green-600/20 text-green-400 px-2 py-1 rounded text-xs">
+                                    Creator
+                                </span>
+                            )}
+                        </div>
+                    </div>
+                    <div className="flex items-center space-x-3">
+                        <span className="text-sm text-gray-300">Welcome, {username}!</span>
+                        <span className={`text-xs px-2 py-1 rounded ${isConnected ? "bg-green-600/20 text-green-400" : "bg-red-600/20 text-red-400"}`}>
+                            {isConnected ? "Connected" : "Disconnected"}
+                        </span>
+                    </div>
                 </div>
             </div>
 
-            <div className="border border-gray-600 rounded overflow-hidden bg-gray-800">
-                <div className="flex justify-between items-center p-4 bg-gray-700 border-b border-gray-600">
-                    <div>
-                        <span className="font-semibold text-white">Room: {currentRoom}</span>
-                        {isCreator && (
-                            <span className="ml-2 text-sm bg-green-700 text-white px-2 py-1 rounded">
-                                (You are the creator)
-                            </span>
-                        )}
-                        {!isCreator && creatorUsername && (
-                            <span className="ml-2 text-sm bg-blue-700 text-white px-2 py-1 rounded">
-                                (Created by {creatorUsername})
-                            </span>
-                        )}
-                        {!isCreator && !creatorUsername && (
-                            <span className="ml-2 text-sm bg-red-700 text-white px-2 py-1 rounded">
-                                (Organizer left)
-                            </span>
-                        )}
-                    </div>
-                    <button
-                        onClick={handleLeaveRoom}
-                        className="bg-red-500 hover:bg-red-600 cursor-pointer text-white p-2 rounded"
-                    >
-                        Leave Room
-                    </button>
-                </div>
+            {/* Main Video Area */}
+            <div className="absolute inset-0 pt-16 pb-20">
+                <div className="w-full h-full bg-black relative">
+                    {/* Overlay Message */}
+                    {overlayMessage && (
+                        <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 z-20 bg-black/80 text-white px-6 py-3 rounded-lg text-lg font-medium">
+                            {overlayMessage}
+                        </div>
+                    )}
 
-                <div className="flex">
-                    <div className="w-1/4 border-r border-gray-600 p-4 bg-gray-750 h-[calc(100vh-200px)] overflow-y-auto text-white">
-                        <h3 className="font-semibold mb-4 text-white">Participants ({roomUsers.length})</h3>
-                        <ul className="space-y-2">
+                    <video
+                        ref={mainVideoRef}
+                        autoPlay
+                        playsInline
+                        muted={isCreator}
+                        className={`w-full h-full object-contain ${(isCreator && !stream) || (!isCreator && !Object.values(remoteStreams).length)
+                            ? 'hidden'
+                            : 'block'
+                            }`}
+                    />
+
+                    {/* Show message when no stream available */}
+                    {((isCreator && !isStreaming) || (!isCreator && !Object.keys(remoteStreams).length)) && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-black">
+                            <div className="text-center">
+                                <div className="text-6xl text-gray-600 mb-4">📹</div>
+                                <p className="text-white text-2xl mb-4">
+                                    {isCreator
+                                        ? "Click 'Start Streaming' to begin"
+                                        : creatorUsername
+                                            ? `Waiting for ${creatorUsername}'s stream`
+                                            : "The organizer has left the room"}
+                                </p>
+                                {isCreator && !isStreaming && (
+                                    <button
+                                        onClick={handleStartStreaming}
+                                        className="bg-blue-600 hover:bg-blue-700 text-white px-8 py-3 rounded-lg text-lg font-semibold transition-colors"
+                                    >
+                                        Start Streaming
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Preview video for creator */}
+                    {stream && isCreator && isStreaming && (
+                        <div className="absolute bottom-4 right-4 w-64 h-48 rounded-lg border-2 border-white/20 overflow-hidden bg-black shadow-2xl">
+                            <video
+                                ref={previewVideoRef}
+                                autoPlay
+                                muted
+                                playsInline
+                                className={`w-full h-full object-cover ${isCameraOff ? 'hidden' : 'block'}`}
+                            />
+                            {isCameraOff && (
+                                <div className="w-full h-full flex items-center justify-center bg-gray-800">
+                                    <FaVideoSlash className="text-white text-3xl" />
+                                </div>
+                            )}
+                            <div className="absolute bottom-2 left-2 bg-black/60 text-white px-2 py-1 rounded text-sm">
+                                You
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Stream paused overlay */}
+                    {isStreamPaused && isCreator && (
+                        <div className="absolute inset-0 bg-black/70 flex items-center justify-center">
+                            <div className="text-white text-3xl font-bold">
+                                Stream Paused
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Hand raise indicator */}
+                    {isHandRaised && (
+                        <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-yellow-500/90 text-black px-4 py-2 rounded-full flex items-center space-x-2">
+                            <FaHandPaper />
+                            <span>Hand Raised</span>
+                        </div>
+                    )}
+                </div>
+            </div>
+
+            {/* Control Bar */}
+            <div className="absolute bottom-0 left-0 right-0 z-30 bg-gray-800/95 backdrop-blur-sm border-t border-gray-700">
+                <div className="flex justify-center items-center py-4 px-6">
+                    <div className="flex items-center space-x-4">
+                        {/* Media Controls */}
+                        {isStreaming && (
+                            <>
+                                <button
+                                    onClick={handleToggleMute}
+                                    className={`${isMuted ? 'bg-red-600 hover:bg-red-700' : 'bg-gray-600 hover:bg-gray-700'} text-white p-4 rounded-full transition-colors`}
+                                    title={isMuted ? 'Unmute' : 'Mute'}
+                                >
+                                    {isMuted ? <FaMicrophoneSlash size={20} /> : <FaMicrophone size={20} />}
+                                </button>
+                                <button
+                                    onClick={handleToggleCamera}
+                                    className={`${isCameraOff ? 'bg-red-600 hover:bg-red-700' : 'bg-gray-600 hover:bg-gray-700'} text-white p-4 rounded-full transition-colors`}
+                                    title={isCameraOff ? 'Turn Camera On' : 'Turn Camera Off'}
+                                >
+                                    {isCameraOff ? <FaVideoSlash size={20} /> : <FaVideo size={20} />}
+                                </button>
+                                {isCreator && (
+                                    <>
+                                        <button
+                                            onClick={handlePauseResumeStream}
+                                            className={`${isStreamPaused ? 'bg-yellow-600 hover:bg-yellow-700' : 'bg-orange-600 hover:bg-orange-700'} text-white p-4 rounded-full transition-colors`}
+                                            title={isStreamPaused ? 'Resume Stream' : 'Pause Stream'}
+                                        >
+                                            {isStreamPaused ? <FaPlay size={20} /> : <FaPause size={20} />}
+                                        </button>
+                                        <button
+                                            onClick={handleStopStreaming}
+                                            className="bg-red-600 hover:bg-red-700 text-white p-4 rounded-full transition-colors"
+                                            title="Stop Stream"
+                                        >
+                                            <FaStop size={20} />
+                                        </button>
+                                    </>
+                                )}
+                            </>
+                        )}
+
+                        {/* Start Streaming Button */}
+                        {isCreator && !isStreaming && (
+                            <button
+                                onClick={handleStartStreaming}
+                                className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-medium transition-colors"
+                            >
+                                Start Streaming
+                            </button>
+                        )}
+
+                        {/* Screen Share */}
+                        <button
+                            onClick={handleToggleScreenShare}
+                            disabled={!isStreaming}
+                            className={`${isScreenSharing ? 'bg-purple-600 hover:bg-purple-700' : 'bg-gray-600 hover:bg-gray-700'} ${!isStreaming ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'} text-white p-4 rounded-full transition-colors`}
+                            title={isStreaming ? (isScreenSharing ? 'Stop Screen Share' : 'Share Screen') : 'Start streaming to share screen'}
+                        >
+                            <FaDesktop size={20} />
+                        </button>
+
+                        {/* Hand Raise */}
+                        <button
+                            onClick={handleToggleHandRaise}
+                            className={`${isHandRaised ? 'bg-yellow-600 hover:bg-yellow-700' : 'bg-gray-600 hover:bg-gray-700'} text-white p-4 rounded-full transition-colors`}
+                            title={isHandRaised ? 'Lower Hand' : 'Raise Hand'}
+                        >
+                            <FaHandPaper size={20} />
+                        </button>
+
+                        {/* Chat */}
+                        <button
+                            onClick={handleToggleChat}
+                            className={`${isChatOpen ? 'bg-blue-600 hover:bg-blue-700' : 'bg-gray-600 hover:bg-gray-700'} text-white p-4 rounded-full transition-colors relative`}
+                            title="Toggle Chat"
+                        >
+                            <FaComments size={20} />
+                        </button>
+
+                        {/* Participants */}
+                        <button
+                            onClick={handleToggleParticipants}
+                            className={`${isParticipantsOpen ? 'bg-blue-600 hover:bg-blue-700' : 'bg-gray-600 hover:bg-gray-700'} text-white p-4 rounded-full transition-colors relative`}
+                            title="Toggle Participants"
+                        >
+                            <FaUsers size={20} />
+                            <span className="absolute -top-2 -right-2 bg-red-500 text-white text-xs rounded-full w-6 h-6 flex items-center justify-center">
+                                {roomUsers.length}
+                            </span>
+                        </button>
+
+                        {/* Fullscreen */}
+                        <button
+                            onClick={handleToggleFullscreen}
+                            className="bg-gray-600 hover:bg-gray-700 text-white p-4 rounded-full transition-colors"
+                            title={isFullscreen ? 'Exit Fullscreen' : 'Enter Fullscreen'}
+                        >
+                            {isFullscreen ? <FaCompress size={20} /> : <FaExpand size={20} />}
+                        </button>
+
+                        {/* Leave Room */}
+                        <button
+                            onClick={handleLeaveRoom}
+                            className="bg-red-600 hover:bg-red-700 text-white px-6 py-3 rounded-lg font-medium transition-colors"
+                        >
+                            Leave Meeting
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            {/* Participants Panel */}
+            {isParticipantsOpen && (
+                <div className="absolute top-16 right-4 bottom-20 w-80 bg-gray-800/95 backdrop-blur-sm border border-gray-600 rounded-lg shadow-2xl z-40">
+                    <div className="flex justify-between items-center p-4 border-b border-gray-600">
+                        <h3 className="font-semibold text-lg">Participants ({roomUsers.length})</h3>
+                        <button
+                            onClick={handleToggleParticipants}
+                            className="text-gray-400 hover:text-white p-1"
+                        >
+                            <FaTimes />
+                        </button>
+                    </div>
+                    <div className="p-4 h-full overflow-y-auto">
+                        <div className="space-y-3">
                             {roomUsers.map((user, index) => (
-                                <li key={index} className="flex justify-between items-center p-2 rounded hover:bg-gray-600 bg-gray-700">
-                                    <span className={`${user.email === email ? "font-medium text-blue-300" : "text-white"}`}>
-                                        {user.username}
-                                        {user.email === email && " (You)"}
-                                        {user.username === creatorUsername && " 👑"}
-                                    </span>
+                                <div key={index} className="flex justify-between items-center p-3 rounded-lg bg-gray-700/50 hover:bg-gray-700">
+                                    <div className="flex items-center space-x-3">
+                                        <div className="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center text-sm font-medium">
+                                            {user.username.charAt(0).toUpperCase()}
+                                        </div>
+                                        <div>
+                                            <span className={`${user.email === email ? "font-medium text-blue-300" : "text-white"}`}>
+                                                {user.username}
+                                                {user.email === email && " (You)"}
+                                            </span>
+                                            {user.username === creatorUsername && (
+                                                <span className="ml-2">👑</span>
+                                            )}
+                                        </div>
+                                    </div>
                                     {isCreator && user.email !== email && (
                                         <button
                                             onClick={() => handleKickUser(user.email)}
-                                            className="text-sm bg-red-600 hover:bg-red-700 cursor-pointer text-white px-3 py-1 rounded"
+                                            className="text-sm bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white px-3 py-1 rounded transition-colors"
                                         >
                                             Kick
                                         </button>
                                     )}
-                                </li>
-                            ))}
-                        </ul>
-                    </div>
-
-                    <div className="w-3/4 p-4 bg-gray-700 h-[calc(100vh-200px)] flex flex-col">
-                        <div className="flex-1 bg-black rounded-lg overflow-hidden relative">
-                            {/* Overlay Message */}
-                            {overlayMessage && (
-                                <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 z-20 bg-black bg-opacity-75 text-white px-4 py-2 rounded-lg text-lg font-medium">
-                                    {overlayMessage}
                                 </div>
-                            )}
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            )}
 
-                            <div className="w-full h-full relative bg-black">
-                                <video
-                                    ref={mainVideoRef}
-                                    autoPlay
-                                    playsInline
-                                    muted={isCreator}
-                                    //muted
-                                    className={`w-full h-full object-contain ${(isCreator && !stream) || (!isCreator && !Object.values(remoteStreams).length)
-                                        ? 'hidden'
-                                        : 'block'
-                                        }`}
-                                />
-
-                                {/* Show message when no stream available */}
-                                {((isCreator && !isStreaming) || (!isCreator && !Object.keys(remoteStreams).length)) && (
-                                    <div className="absolute inset-0 flex items-center justify-center bg-black">
-                                        <p className="text-white text-xl">
-                                            {isCreator
-                                                ? "Click 'Start Streaming' to begin"
-                                                : creatorUsername
-                                                    ? `Waiting for ${creatorUsername}'s stream`
-                                                    : "The organizer has left the room"}
-                                        </p>
-                                    </div>
-                                )}
-
-                                {/* Preview video for creator */}
-                                {stream && isCreator && isStreaming && (
-                                    <div className="absolute bottom-4 right-4 w-48 h-36 rounded-lg border-2 border-white overflow-hidden bg-black">
-                                        <video
-                                            ref={previewVideoRef}
-                                            autoPlay
-                                            muted
-                                            playsInline
-                                            className={`w-full h-full object-cover ${isCameraOff ? 'hidden' : 'block'}`}
-                                        />
-                                        {isCameraOff && (
-                                            <div className="w-full h-full flex items-center justify-center bg-gray-800">
-                                                <FaVideoSlash className="text-white text-2xl" />
-                                            </div>
-                                        )}
-                                    </div>
-                                )}
-
-                                {/* Stream paused overlay */}
-                                {isStreamPaused && isCreator && (
-                                    <div className="absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center">
-                                        <div className="text-white text-2xl font-bold">
-                                            Stream Paused
-                                        </div>
-                                    </div>
-                                )}
+            {/* Chat Panel */}
+            {isChatOpen && (
+                <div className="absolute top-16 right-4 bottom-20 w-80 bg-gray-800/95 backdrop-blur-sm border border-gray-600 rounded-lg shadow-2xl z-40">
+                    <div className="flex justify-between items-center p-4 border-b border-gray-600">
+                        <h3 className="font-semibold text-lg">Chat</h3>
+                        <button
+                            onClick={handleToggleChat}
+                            className="text-gray-400 hover:text-white p-1"
+                        >
+                            <FaTimes />
+                        </button>
+                    </div>
+                    <div className="p-4 h-full flex flex-col">
+                        <div className="flex-1 overflow-y-auto mb-4">
+                            {/* Chat messages would go here */}
+                            <div className="text-center text-gray-400 py-8">
+                                <FaComments size={48} className="mx-auto mb-4 opacity-50" />
+                                <p>No messages yet</p>
+                                <p className="text-sm mt-2">Start a conversation!</p>
                             </div>
                         </div>
-
-                        <div className="mt-4 flex justify-center space-x-4">
-                            {isStreaming && (
-                                <>
-                                    <button
-                                        onClick={handleToggleMute}
-                                        className={`${isMuted ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'} text-white p-3 rounded-full`}
-                                        title={isMuted ? 'Unmute' : 'Mute'}
-                                    >
-                                        {isMuted ? <FaMicrophoneSlash /> : <FaMicrophone />}
-                                    </button>
-                                    <button
-                                        onClick={handleToggleCamera}
-                                        className={`${isCameraOff ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'} text-white p-3 rounded-full`}
-                                        title={isCameraOff ? 'Turn Camera On' : 'Turn Camera Off'}
-                                    >
-                                        {isCameraOff ? <FaVideoSlash /> : <FaVideo />}
-                                    </button>
-                                    {isCreator && (
-                                        <button
-                                            onClick={handlePauseResumeStream}
-                                            className={`${isStreamPaused ? 'bg-yellow-500 hover:bg-yellow-600' : 'bg-orange-500 hover:bg-orange-600'} text-white p-3 rounded-full`}
-                                            title={isStreamPaused ? 'Resume Stream' : 'Pause Stream'}
-                                        >
-                                            {isStreamPaused ? <FaPlay /> : <FaPause />}
-                                        </button>
-                                    )}
-                                    {isCreator && (
-                                        <button
-                                            onClick={handleStopStreaming}
-                                            className="bg-red-500 hover:bg-red-600 text-white p-3 rounded-full"
-                                            title="Stop Stream"
-                                        >
-                                            <FaStop />
-                                        </button>
-                                    )}
-                                </>
-                            )}
-
-                            {isCreator && !isStreaming && (
-                                <button
-                                    onClick={handleStartStreaming}
-                                    className="bg-green-500 hover:bg-green-600 text-white p-2 px-4 rounded"
-                                >
-                                    Start Streaming
-                                </button>
-                            )}
-
-                            <button
-                                onClick={handleLeaveRoom}
-                                className="bg-red-500 hover:bg-red-600 text-white p-2 px-4 rounded"
-                            >
-                                Leave Meeting
+                        <div className="flex space-x-2">
+                            <input
+                                type="text"
+                                placeholder="Type a message..."
+                                className="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-400 focus:outline-none focus:border-blue-500"
+                            />
+                            <button className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition-colors">
+                                Send
                             </button>
                         </div>
                     </div>
                 </div>
-            </div>
-
-            <div className="mt-2">
-                <span className={`inline-block px-2 py-1 rounded text-sm ${isConnected ? "bg-green-700 text-green-200" : "bg-red-700 text-red-200"}`}>
-                    {isConnected ? "Connected to server" : "Disconnected"}
-                </span>
-            </div>
+            )}
         </div>
     );
 }

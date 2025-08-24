@@ -43,6 +43,11 @@ export default function StreamingPage() {
     const [isHandRaised, setIsHandRaised] = useState(false);
     const [isFullscreen, setIsFullscreen] = useState(false);
 
+    //states for messaging
+    const [message, setMessage] = useState(null)
+    const [newMessage, setNewMessage] = useState("")
+
+
     const mainVideoRef = useRef(null);
     const previewVideoRef = useRef(null);
     const remoteVideoRefs = useRef({});
@@ -60,7 +65,7 @@ export default function StreamingPage() {
     };
 
     // Initialize media streams
-    const initializeMediaStreams = useCallback(async () => {
+    const initializeMediaStreams = useCallback(async (isJoinee = false) => {
         try {
             console.log("Getting user media permissions");
             const mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -107,6 +112,14 @@ export default function StreamingPage() {
                     .catch(err => console.error("Preview video play failed", err));
             }
 
+            //FOR Joinees , also set as main video intitally
+            if (isJoinee && mainVideoRef.current) {
+                mainVideoRef.current.srcObject = mediaStream;
+                mainVideoRef.current.play()
+                    .then(() => console.log("Preview playback started"))
+                    .catch(err => console.error("Preview video play failed", err));
+            }
+
             mediaStream.getVideoTracks().forEach(track => {
                 track.enabled = !isCameraOff;
             });
@@ -114,6 +127,23 @@ export default function StreamingPage() {
             mediaStream.getAudioTracks().forEach(track => {
                 track.enabled = !isMuted;
             });
+
+            //if we are already connected to peers, add our tracks to existing connections
+
+            Object.values(peerConnections.current).forEach(pc => {
+                if (streamRef.current) {
+                    streamRef.current.getTracks().forEach(track => {
+                        const sender = pc.getSenders().find(s => s.track && s.track.kind === track.kind)
+
+                        if (sender) {
+                            sender.replaceTrack(track)
+                        }
+                        else {
+                            pc.addTrack(track)
+                        }
+                    })
+                }
+            })
 
             return mediaStream;
         } catch (error) {
@@ -127,6 +157,22 @@ export default function StreamingPage() {
         }
     }, [isMuted, isCameraOff, isCreator]);
 
+    //initializing media streams for joinees as well , when they join
+
+    const initializeJoineeMedia = async () => {
+        if (isCreator) return;
+
+        try {
+            const mediaStream = await initializeMediaStreams(true)
+            if (!mediaStream) return
+
+            //notify others , we are readyd to stream
+            socket.emit("joinee-ready", currentRoom)
+            setIsStreaming(true)
+            toast.success("you are streaming now")
+        }
+        catch (e) { }
+    }
     // Create Peer Connection
     const createPeerConnection = (socketId) => {
         const peerConnection = new RTCPeerConnection({
@@ -135,7 +181,7 @@ export default function StreamingPage() {
             ]
         });
 
-        //add our stream track if we have a stream
+        //add our stream track if we have a stream (both creator and joinees)
         if (streamRef.current && isCreator) {
             streamRef.current.getTracks().forEach((track) => {
                 peerConnection.addTrack(track, streamRef.current)
@@ -157,12 +203,14 @@ export default function StreamingPage() {
 
             setRemoteStreams(prev => ({
                 ...prev,
-                [socketId]: remoteStream
+                [socketId]: remoteStream,
+                username: roomUsers.find(user => user.socketId === socketId)?.username || 'Unknown'
             }));
 
-            // For joinees, always update the main video with the first received stream
-            if (!isCreator && mainVideoRef.current) {
-                mainVideoRef.current.srcObject = remoteStream
+            // For all users, update the UI to show the screen share
+
+            if (mainVideoRef.current && !isCreator) {
+                mainVideoRef.current.srcObject = remoteStream;
                 const p = mainVideoRef.current.play();
                 if (p) p.catch(err => console.warn("autoplay rejected; user gesture needed", err));
             }
@@ -196,17 +244,7 @@ export default function StreamingPage() {
         }
     };
 
-    const getVideoAreaMessage = () => {
-        if (isCreator) {
-            return isStreaming ? "Your stream" : "Click 'Start Streaming' to begin";
-        }
 
-        if (!creatorUsername) {
-            return "The organizer has left the room";
-        }
-
-        return `Waiting for ${creatorUsername}'s stream`;
-    };
 
     // Pause/Resume streaming
     const handlePauseResumeStream = () => {
@@ -302,22 +340,38 @@ export default function StreamingPage() {
         if (!socket || !currentRoom) return;
 
         const handleReady = async ({ socketId, email: peerEmail, username: peerUsername }) => {
-            if (isCreator) return
+
             if (!socketId || peerEmail === email) return;
 
             console.log("Creating peer connection for:", socketId, peerEmail);
             const peerConnection = createPeerConnection(socketId);
 
             try {
+
                 const offer = await peerConnection.createOffer();
                 await peerConnection.setLocalDescription(offer);
                 socket.emit("offer", offer, currentRoom, socketId);
+
             } catch (error) {
                 console.error("Error creating offer:", error);
                 toast.error("Failed to create peer connection", { duration: 3000 });
             }
         };
 
+        //handling joinee ready or not
+
+        const handleJoineeReady = async ({ socketId, email: peerEmail, username: peerUsername }) => {
+            if (!socketId) return;
+
+            console.log("creating peer connection for joinee", socketId, peerEmail);
+            const peerConnection = createPeerConnection(socketId, true)
+            try {
+                const offer = peerConnection.createOffer()
+                await peerConnection.setLocalDescription(offer)
+                socket.email("offer", offer, currentRoom, socketId)
+            }
+            catch (e) { console.log(e); }
+        }
         const handleOffer = async ({ offer, sender }) => {
             if (!isCreator) return; // creator should not handle offers, only joinees respond
 
@@ -370,11 +424,45 @@ export default function StreamingPage() {
             }
         };
 
+
+        const handleMessageReceived = (data) => {
+            setMessage(prev => [...prev, {
+                id: data.id,
+                sender: data.sender,
+                message: data.message,
+                timestamp: data.timestamp,
+                isOwn: data.senderEmail === email
+            }])
+        }
+
+        const handleMessageHistory = (messageHistory) => {
+            const messages = Array.isArray(messageHistory)
+                ? messageHistory
+                : [messageHistory];
+
+            setMessage(messages.map(msg => ({
+                id: msg.id,
+                sender: msg.sender,
+                message: msg.message,
+                timestamp: msg.timestamp,
+                isOwn: msg.senderEmail === email
+            })));
+        };
+
+
+        if (isAuthenticated) {
+            socket.emit("request-message-history", currentRoom);
+        }
+
+        socket.on("message-history", handleMessageHistory)
+        socket.on("message-received", handleMessageReceived)
+
         socket.on("ready", handleReady);
         socket.on("offer", handleOffer);
         socket.on("answer", handleAnswer);
         socket.on("ice-candidate", handleIceCandidate);
         socket.on("stream-stopped", handleStreamStopped);
+        socket.on("joinee-ready", handleJoineeReady)
 
         return () => {
             socket.off("ready", handleReady);
@@ -382,8 +470,28 @@ export default function StreamingPage() {
             socket.off("answer", handleAnswer);
             socket.off("ice-candidate", handleIceCandidate);
             socket.off("stream-stopped", handleStreamStopped);
+            socket.off("message-received", handleMessageReceived);
+            socket.off("message-history", handleMessageHistory);
         };
     }, [socket, currentRoom, stream, isCreator]);
+
+
+    const handleSendMessage = () => {
+        if (!newMessage.trim() || !socket || !currentRoom) return;
+
+        const messageData = {
+            roomName: currentRoom,
+            message: newMessage.trim(),
+            sender: username,
+            senderEmail: email,
+            timestamp: new Date().toISOString()
+        };
+
+        socket.emit("send-message", messageData);
+        setNewMessage("");
+    };
+
+
 
     // Update video display when stream changes
     useEffect(() => {
@@ -563,7 +671,7 @@ export default function StreamingPage() {
 
                 //handle if user cancels screen share  
                 screenStream.getVideoTracks()[0].onended = stopScreenShare;
-
+                screenStream.getAudioTracks()[0].onended = stopScreenShare
                 screenStreamRef.current = screenStream
                 setisScreenSharing(true)
 
@@ -597,7 +705,7 @@ export default function StreamingPage() {
         }
 
         //revert to local video display to camera
-        if (mainVideoRef.current && isCreator && streamRef.current) {
+        if (mainVideoRef.current && streamRef.current) {
             mainVideoRef.current.srcObject = streamRef.current
         }
         toast.success("screen sharing stopped")
@@ -614,6 +722,14 @@ export default function StreamingPage() {
             if (videoSender && newStream.getVideoTracks().length > 0) {
                 videoSender.replaceTrack(newStream.getVideoTracks()[0])
                     .catch(error => console.error("Error replacing video track:", error));
+            }
+
+            const audioSender = senders.find(sender => {
+                sender.track && sender.track.kind === 'audio'
+            })
+            if (audioSender && newStream.getAudioTracks().length > 0) {
+                audioSender.replaceTrack(newStream.getAudioTracks()[0])
+                    .catch(e => console.error("error replacing audio tracks", e))
             }
         })
     }
@@ -724,8 +840,8 @@ export default function StreamingPage() {
                         </div>
                     )}
 
-                    {/* Preview video for creator */}
-                    {stream && isCreator && isStreaming && (
+                    {/* Preview video for creator or joinee with active stream */}
+                    {stream && ((isCreator && isStreaming) || (!isCreator && stream)) && (
                         <div className="absolute bottom-4 right-4 w-64 h-48 rounded-lg border-2 border-white/20 overflow-hidden bg-black shadow-2xl">
                             <video
                                 ref={previewVideoRef}
@@ -768,8 +884,8 @@ export default function StreamingPage() {
             <div className="absolute bottom-0 left-0 right-0 z-30 bg-gray-800/95 backdrop-blur-sm border-t border-gray-700">
                 <div className="flex justify-center items-center py-4 px-6">
                     <div className="flex items-center space-x-4">
-                        {/* Media Controls */}
-                        {isStreaming && (
+                        {/* Media Controls for creator when streaming OR for joinee when they have stream */}
+                        {(isStreaming || (!isCreator && stream)) && (
                             <>
                                 <button
                                     onClick={handleToggleMute}
@@ -785,68 +901,103 @@ export default function StreamingPage() {
                                 >
                                     {isCameraOff ? <FaVideoSlash size={20} /> : <FaVideo size={20} />}
                                 </button>
-                                {isCreator && (
-                                    <>
-                                        <button
-                                            onClick={handlePauseResumeStream}
-                                            className={`${isStreamPaused ? 'bg-yellow-600 hover:bg-yellow-700' : 'bg-orange-600 hover:bg-orange-700'} text-white p-4 rounded-full transition-colors`}
-                                            title={isStreamPaused ? 'Resume Stream' : 'Pause Stream'}
-                                        >
-                                            {isStreamPaused ? <FaPlay size={20} /> : <FaPause size={20} />}
-                                        </button>
-                                        <button
-                                            onClick={handleStopStreaming}
-                                            className="bg-red-600 hover:bg-red-700 text-white p-4 rounded-full transition-colors"
-                                            title="Stop Stream"
-                                        >
-                                            <FaStop size={20} />
-                                        </button>
-                                    </>
-                                )}
                             </>
                         )}
 
-                        {/* Start Streaming Button */}
-                        {isCreator && !isStreaming && (
+                        {/* Creator-specific streaming controls */}
+                        {isCreator && isStreaming && (
+                            <>
+                                <button
+                                    onClick={handlePauseResumeStream}
+                                    className={`${isStreamPaused ? 'bg-yellow-600 hover:bg-yellow-700' : 'bg-orange-600 hover:bg-orange-700'} text-white p-4 rounded-full transition-colors`}
+                                    title={isStreamPaused ? 'Resume Stream' : 'Pause Stream'}
+                                >
+                                    {isStreamPaused ? <FaPlay size={20} /> : <FaPause size={20} />}
+                                </button>
+                                <button
+                                    onClick={handleStopStreaming}
+                                    className="bg-red-600 hover:bg-red-700 text-white p-4 rounded-full transition-colors"
+                                    title="Stop Stream"
+                                >
+                                    <FaStop size={20} />
+                                </button>
+                            </>
+                        )}
+
+                        {/* Start Streaming Button for creator OR Initialize Media for joinee */}
+                        {isCreator ? (
+                            !isStreaming && (
+                                <button
+                                    onClick={handleStartStreaming}
+                                    className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-medium transition-colors"
+                                >
+                                    Start Streaming
+                                </button>
+                            )
+                        ) : (
+                            !stream && (
+                                <button
+                                    onClick={initializeJoineeMedia}
+                                    className="bg-green-600 hover:bg-green-700 text-white px-6 py-3 rounded-lg font-medium transition-colors"
+                                >
+                                    Join With Media
+                                </button>
+                            )
+                        )}
+
+                        {/* Screen Share for all users with media */}
+                        {(isStreaming || stream) && (
                             <button
-                                onClick={handleStartStreaming}
-                                className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-medium transition-colors"
+                                onClick={handleToggleScreenShare}
+                                className={`${isScreenSharing ? 'bg-purple-600 hover:bg-purple-700' : 'bg-gray-600 hover:bg-gray-700'} text-white p-4 rounded-full transition-colors`}
+                                title={isScreenSharing ? 'Stop Screen Share' : 'Share Screen'}
                             >
-                                Start Streaming
+                                <FaDesktop size={20} />
                             </button>
                         )}
 
-                        {/* Screen Share */}
-                        <button
-                            onClick={handleToggleScreenShare}
-                            disabled={!isStreaming}
-                            className={`${isScreenSharing ? 'bg-purple-600 hover:bg-purple-700' : 'bg-gray-600 hover:bg-gray-700'} ${!isStreaming ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'} text-white p-4 rounded-full transition-colors`}
-                            title={isStreaming ? (isScreenSharing ? 'Stop Screen Share' : 'Share Screen') : 'Start streaming to share screen'}
-                        >
-                            <FaDesktop size={20} />
-                        </button>
-
                         {/* Hand Raise */}
                         <button
-                            onClick={handleToggleHandRaise}
-                            className={`${isHandRaised ? 'bg-yellow-600 hover:bg-yellow-700' : 'bg-gray-600 hover:bg-gray-700'} text-white p-4 rounded-full transition-colors`}
-                            title={isHandRaised ? 'Lower Hand' : 'Raise Hand'}
+                            onClick={() => setIsHandRaised(!isHandRaised)}
+                            disabled={!(isStreaming || stream)}
+                            className={`
+                        ${isHandRaised ? 'bg-yellow-500 hover:bg-yellow-600' : 'bg-gray-600 hover:bg-gray-700'}
+                         text-white p-4 rounded-full transition-colors relative
+                         ${!(isStreaming || stream) ? 'opacity-50 cursor-not-allowed' : ''}
+                        `}
+                            title={
+                                !(isStreaming || stream)
+                                    ? 'Join with media to raise your hand'
+                                    : isHandRaised
+                                        ? 'Lower Hand'
+                                        : 'Raise Hand'
+                            }
                         >
                             <FaHandPaper size={20} />
                         </button>
 
-                        {/* Chat */}
                         <button
-                            onClick={handleToggleChat}
-                            className={`${isChatOpen ? 'bg-blue-600 hover:bg-blue-700' : 'bg-gray-600 hover:bg-gray-700'} text-white p-4 rounded-full transition-colors relative`}
-                            title="Toggle Chat"
+                            onClick={() => {
+                                setIsParticipantsOpen(false);
+                                setIsChatOpen(!isChatOpen);
+                            }}
+                            className={`
+    ${isChatOpen ? 'bg-blue-600 hover:bg-blue-700' : 'bg-gray-700 hover:bg-gray-500'}
+      border-gray-400
+    text-white p-4 rounded-full transition-colors relative
+  `}
+                            title={isChatOpen ? 'Close Chat' : 'Open Chat'}
                         >
                             <FaComments size={20} />
                         </button>
 
+
                         {/* Participants */}
                         <button
-                            onClick={handleToggleParticipants}
+                            onClick={() => {
+                                setIsChatOpen(false); // Close chat panel if open
+                                setIsParticipantsOpen(!isParticipantsOpen);
+                            }}
                             className={`${isParticipantsOpen ? 'bg-blue-600 hover:bg-blue-700' : 'bg-gray-600 hover:bg-gray-700'} text-white p-4 rounded-full transition-colors relative`}
                             title="Toggle Participants"
                         >
@@ -882,7 +1033,7 @@ export default function StreamingPage() {
                     <div className="flex justify-between items-center p-4 border-b border-gray-600">
                         <h3 className="font-semibold text-lg">Participants ({roomUsers.length})</h3>
                         <button
-                            onClick={handleToggleParticipants}
+                            onClick={() => setIsParticipantsOpen(false)}
                             className="text-gray-400 hover:text-white p-1"
                         >
                             <FaTimes />
@@ -927,28 +1078,52 @@ export default function StreamingPage() {
                     <div className="flex justify-between items-center p-4 border-b border-gray-600">
                         <h3 className="font-semibold text-lg">Chat</h3>
                         <button
-                            onClick={handleToggleChat}
+                            onClick={() => setIsChatOpen(false)}
                             className="text-gray-400 hover:text-white p-1"
                         >
                             <FaTimes />
                         </button>
                     </div>
                     <div className="p-4 h-full flex flex-col">
-                        <div className="flex-1 overflow-y-auto mb-4">
-                            {/* Chat messages would go here */}
-                            <div className="text-center text-gray-400 py-8">
-                                <FaComments size={48} className="mx-auto mb-4 opacity-50" />
-                                <p>No messages yet</p>
-                                <p className="text-sm mt-2">Start a conversation!</p>
-                            </div>
+                        <div className="flex-1 overflow-y-auto mb-4 space-y-3">
+                            {message.length === 0 ? (
+                                <div className="text-center text-gray-400 py-8">
+                                    <FaComments size={48} className="mx-auto mb-4 opacity-50" />
+                                    <p>No messages yet</p>
+                                    <p className="text-sm mt-2">Start a conversation!</p>
+                                </div>
+                            ) : (
+                                message.map((msg) => (
+                                    <div
+                                        key={msg.id}
+                                        className={`p-3 rounded-lg ${msg.isOwn
+                                            ? 'bg-blue-600/30 ml-8'
+                                            : 'bg-gray-700/50 mr-8'}`}
+                                    >
+                                        {!msg.isOwn && (
+                                            <div className="text-xs font-semibold text-blue-300 mb-1">
+                                                {msg.sender}
+                                            </div>
+                                        )}
+                                        <div className="text-white text-sm">{msg.message}</div>
+                                    </div>
+                                ))
+                            )}
                         </div>
                         <div className="flex space-x-2">
                             <input
                                 type="text"
+                                value={newMessage}
+                                onChange={(e) => setNewMessage(e.target.value)}
+                                onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
                                 placeholder="Type a message..."
                                 className="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-400 focus:outline-none focus:border-blue-500"
                             />
-                            <button className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition-colors">
+                            <button
+                                onClick={handleSendMessage}
+                                disabled={!newMessage.trim()}
+                                className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg transition-colors"
+                            >
                                 Send
                             </button>
                         </div>

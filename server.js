@@ -16,7 +16,7 @@ const handle = app.getRequestHandler();
 const emailToSocketMapping = new Map();
 const roomCreators = new Map();
 const roomUsers = new Map();
-
+const roomMessages = new Map()
 app.prepare().then(() => {  //this line boots nextjs internally  but doesn't start its own server
     const server = createServer((req, res) => {  //method from http 
         const parsedUrl = parse(req.url, true);
@@ -271,6 +271,11 @@ app.prepare().then(() => {  //this line boots nextjs internally  but doesn't sta
                     });
 
                     console.log(`${userInfo.username} left ${roomName}`);
+
+                    if (updatedUsers.length === 0) {
+                        roomMessages.delete(roomName)
+                        console.log(`cleared messages from room :  ${roomName}`);
+                    }
                 }
             } catch (error) {
                 console.error("Leave error:", error);
@@ -354,6 +359,10 @@ app.prepare().then(() => {  //this line boots nextjs internally  but doesn't sta
                         }
                     }
                 }
+                if (updatedUsers.length === 0) {
+                    roomMessages.delete(roomName);
+                    console.log(`Cleared messages for empty room: ${roomName}`);
+                }
 
                 console.log(`Disconnected: ${user?.username || socket.id}`);
             } catch (error) {
@@ -361,6 +370,65 @@ app.prepare().then(() => {  //this line boots nextjs internally  but doesn't sta
             }
         });
 
+        //JOINEE-READY SOCKET PART
+        socket.on("joinee-ready", (roomName) => {
+            const room = io.sockets.adapter.rooms.get(roomName)
+            if (room) {
+                room.forEach((socketId) => {
+                    if (socketId !== socket.id) {
+                        io.to(socketId).emit("joinee-ready", {
+                            socketId: socket.id,
+                            email: socket.data.email,
+                            username: socket.data.username
+                        })
+                    }
+                })
+            }
+        })
+        //MESSAGEING HANDLER
+
+        socket.on("send-message", async (data) => {
+
+            try {
+
+                const { roomName, message, sender, senderEmail, timestamp } = data
+                if (!message || !roomName) return;
+
+                //initialize message storage for room if not already
+                if (!roomMessages.has(roomName)) {
+                    roomMessages.set(roomName, [])
+                }
+
+                const messageObj = {
+                    id: Date.now().toString() + Math.random().toString().substr(2, 5),
+                    sender,
+                    senderEmail,
+                    message,
+                    roomName,
+                    timestamp: timestamp || new Date().toISOString()
+                }
+                //Add messages to room history
+                const Addmessages = roomMessages.get(roomName)
+                Addmessages.push(messageObj)
+
+                //keep only the last 100 messages per room
+                if (Addmessages.length > 100) { Addmessages.shift() }
+
+                //broadcasting all users
+                io.to(roomName).emit("message-received", messageObj)
+                console.log(`messages from ${sender} in ${roomName} : ${message}`);
+
+            }
+            catch (e) {
+                console.log(e);
+            }
+        })
+
+        //mesage history request k liye handler
+        socket.on("request-message-history", (roomName) => {
+            const messages = roomMessages.get(roomName) || 'no messages yet'
+            socket.emit("message-history", messages)
+        })
         socket.on("error", (error) => {
             console.error(`Socket error [${socket.id}]:`, error);
         });
